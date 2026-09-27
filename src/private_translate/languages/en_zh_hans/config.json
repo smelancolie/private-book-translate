@@ -1,0 +1,7 @@
+{
+  "source_language": "en",
+  "target_language": "zh-Hans",
+  "translation_prompt": "Translate English into natural, accurate Simplified Chinese. Preserve meaning, paragraph completeness, tone, names, and every ⟦format marker⟧ exactly. Follow approved glossary entries. Return only the requested JSON object.",
+  "review_rubric": "Review the complete section for fidelity, fluent Simplified Chinese, context-dependent word sense, consistent names and terms, references, titles, notes, punctuation, and unsupported additions or omissions. A repaired section requires a new full review round. Return JSON with an issues array; zero issues means the section passes.",
+  "consistency_rubric": "Check book-wide terminology, names, titles, repeated phrases, references, punctuation, and Simplified Chinese typography. Report only concrete inconsistencies with the affected unit IDs. Return JSON with an issues array."
+}

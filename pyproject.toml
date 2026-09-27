@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "private-book-translate"
+version = "0.1.0"
+description = "Local-first EPUB and Markdown translation workspaces"
+requires-python = ">=3.11"
+dependencies = ["lxml>=5"]
+
+[project.scripts]
+translate = "private_translate.cli:main"
+
+[tool.setuptools.package-data]
+private_translate = ["languages/**/*.json"]
