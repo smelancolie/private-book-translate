@@ -16,7 +16,12 @@ from private_translate.core.pipeline import (
 )
 from private_translate.core.project import create_project
 from private_translate.core.model import Document
-from private_translate.core.spotcheck import create_spotcheck_round
+from private_translate.core.spotcheck import (
+    DEFAULT_AGENT_SPOTCHECK_MODEL,
+    SpotcheckExecutor,
+    create_spotcheck_round,
+    run_agent_spotcheck_round,
+)
 from private_translate.core.state import read_json
 
 
@@ -45,12 +50,18 @@ def parser() -> argparse.ArgumentParser:
     spotcheck.add_argument("project", type=Path)
     spotcheck.add_argument("--seed", type=int)
     spotcheck.add_argument("--new-run", action="store_true", help="start a new current-run review campaign")
+    spotcheck.add_argument("--spotcheck-backend", choices=("template", "agent"), default="template")
+    spotcheck.add_argument("--spotcheck-model", default=DEFAULT_AGENT_SPOTCHECK_MODEL)
+    spotcheck.add_argument("--reviewer-a-id", default="agent:spotcheck-a")
+    spotcheck.add_argument("--reviewer-b-id", default="agent:spotcheck-b")
     return root
 
 
 def main(
     argv: list[str] | None = None, *, agent_executor: AgentExecutor | None = None,
     review_executor: AgentExecutor | None = None,
+    spotcheck_executor_a: SpotcheckExecutor | None = None,
+    spotcheck_executor_b: SpotcheckExecutor | None = None,
 ) -> int:
     args = parser().parse_args(argv)
     if args.command == "init":
@@ -77,7 +88,17 @@ def main(
             project = args.project.resolve(strict=True)
             assert_project_source_current(project)
             document = Document.from_dict(read_json(project / "work" / "document.json"))
-            print(create_spotcheck_round(project, document, args.seed, new_run=args.new_run))
+            if args.spotcheck_backend == "agent":
+                if spotcheck_executor_a is None or spotcheck_executor_b is None:
+                    raise RuntimeError("AGENT_SPOTCHECK_BACKEND_UNAVAILABLE: provide two independent host executors")
+                result = run_agent_spotcheck_round(
+                    project, document, args.seed, args.reviewer_a_id, args.reviewer_b_id,
+                    spotcheck_executor_a, spotcheck_executor_b,
+                    model=args.spotcheck_model, new_run=args.new_run,
+                )
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(create_spotcheck_round(project, document, args.seed, new_run=args.new_run))
             return 0
         if args.command in {"run", "resume"}:
             outputs = run_project(
