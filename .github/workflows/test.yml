@@ -20,7 +20,34 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: sudo apt-get update && sudo apt-get install -y pandoc
       - run: python -m pip install -e .
-      - run: python -m unittest discover -s tests -v
+      - name: Run normal unit tests
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import sys
+          import unittest
+
+          loader = unittest.TestLoader()
+          suite = unittest.TestSuite()
+          for path in sorted(Path("tests").glob("test_*.py")):
+              if path.name != "test_large_book.py":
+                  suite.addTests(loader.discover("tests", pattern=path.name))
+
+          result = unittest.TextTestRunner(verbosity=2).run(suite)
+          sys.exit(not result.wasSuccessful())
+          PY
+
+  large-book-regression:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y pandoc
+      - run: python -m pip install -e .
+      - run: python -m unittest discover -s tests -p test_large_book.py -v
 
   epubcheck:
     runs-on: ubuntu-latest
