@@ -15,7 +15,7 @@ from .language import load_language_package
 from .model import Document
 from .batching import maximum_unit_tokens, split_oversized_units, translation_batches
 from .providers import OpenAICompatibleProvider, TranslationProvider
-from .qa import run_book_consistency, run_chapter_qa, validate_qa
+from .qa import _target_hash, run_book_consistency, run_chapter_qa, run_chapter_qa_agent, validate_qa
 from .spotcheck import validate_spotcheck
 from .execution import (
     PatchConflict,
@@ -30,6 +30,7 @@ from .state import merge_saved_state, read_json, write_json
 
 
 DEFAULT_AGENT_MODEL = "gpt-6-luna-max"
+DEFAULT_AGENT_REVIEW_MODEL = "gpt-6-luna-max"
 
 
 class AgentExecutor(Protocol):
@@ -215,13 +216,33 @@ def run_project(
     project: Path, *, base_url: str | None = None, model: str | None = None,
     bilingual: bool = False, provider: TranslationProvider | None = None,
     translation_backend: int = 2, agent_executor: AgentExecutor | None = None,
-    agent_model: str = DEFAULT_AGENT_MODEL,
+    agent_model: str = DEFAULT_AGENT_MODEL, review_backend: int = 2,
+    review_executor: AgentExecutor | None = None, reviewer_id: str = "agent:chapter-reviewer",
+    review_model: str = DEFAULT_AGENT_REVIEW_MODEL, allow_review_fallback: bool = False,
 ) -> list[Path]:
     backend = select_translation_backend(translation_backend)
     if backend == "agent" and agent_executor is None:
         raise RuntimeError("AGENT_BACKEND_UNAVAILABLE: provide a host-native AgentExecutor; API fallback is disabled")
+    selected_review_backend = select_translation_backend(review_backend)
+    fallback_reason = None
+    if selected_review_backend == "agent" and review_executor is None:
+        if not allow_review_fallback:
+            raise RuntimeError("AGENT_REVIEW_UNAVAILABLE: API fallback requires explicit allow_review_fallback")
+        selected_review_backend = "api"
+        fallback_reason = "AGENT_REVIEW_UNAVAILABLE"
+    translation_owner_id = "agent:translation-owner" if backend == "agent" else "api:translation-owner"
+    if selected_review_backend == "agent" and reviewer_id == translation_owner_id:
+        raise ValueError("reviewer_id must differ from translation_owner_id")
     project, manifest, saved = _load_project(project)
-    _write_run_state(project, "running", requested_backend=translation_backend, actual_backend=1 if backend == "agent" else 2)
+    _write_run_state(
+        project, "running", requested_backend=translation_backend,
+        actual_backend=1 if backend == "agent" else 2,
+        requested_review_backend=review_backend,
+        actual_review_backend=1 if selected_review_backend == "agent" else 2,
+        fallback_reason=fallback_reason,
+        translation_owner_id=translation_owner_id,
+        reviewer_id=reviewer_id if selected_review_backend == "agent" else "api:reviewer",
+    )
     if bilingual:
         manifest["bilingual"] = True
         write_json(project / "project.json", manifest)
@@ -239,9 +260,28 @@ def run_project(
         fresh = _translate_agent(fresh, project, active_provider, language, glossary, agent_executor, agent_model)
     else:
         _translate(fresh, project, active_provider, language, glossary)
-    run_chapter_qa(project, fresh, active_provider, language, glossary)
-    run_book_consistency(project, fresh, active_provider, language, glossary)
-    result = _build(project, manifest, fresh)
+    if selected_review_backend == "agent":
+        for _ in range(3):
+            run_book_consistency(project, fresh, active_provider, language, glossary)
+            fresh = run_chapter_qa_agent(
+                project, fresh, active_provider, language, glossary, review_executor,
+                reviewer_id=reviewer_id, translation_owner_id=translation_owner_id,
+                review_model=review_model, translation_backend=1 if backend == "agent" else 2,
+                translation_executor=agent_executor if backend == "agent" else None,
+                translation_model=agent_model,
+            )
+            report = read_json(project / "qa" / "book-consistency.json")
+            if report.get("status") == "PASS" and report.get("target_hash") == _target_hash(
+                [unit for unit in fresh.units if unit.translatable and unit.target_text is not None]
+            ):
+                break
+        else:
+            raise RuntimeError("Agent chapter QA and book consistency did not converge on one target revision")
+        result = _build(project, manifest, fresh)
+    else:
+        run_chapter_qa(project, fresh, active_provider, language, glossary)
+        run_book_consistency(project, fresh, active_provider, language, glossary)
+        result = _build(project, manifest, fresh)
     _write_run_state(project, "spotcheck_pending")
     return result
 

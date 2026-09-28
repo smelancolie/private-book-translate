@@ -480,9 +480,20 @@ def review_target_digest(target_units: list[dict]) -> str:
     return _hash_json(target_units)
 
 
-def create_review_task(document: Document, chapter_id: str, reviewer_id: str, translation_owner_id: str, rubric: str, context_capsule: dict | None = None) -> dict:
-    units = [unit for unit in document.units if unit.section_id == chapter_id and unit.translatable]
-    _require(bool(units), f"Unknown or empty chapter {chapter_id!r}")
+def create_review_task(
+    document: Document, chapter_id: str, reviewer_id: str, translation_owner_id: str,
+    rubric: str, context_capsule: dict | None = None, unit_ids: list[str] | None = None,
+) -> dict:
+    chapter_units = [unit for unit in document.units if unit.section_id == chapter_id and unit.translatable]
+    _require(bool(chapter_units), f"Unknown or empty chapter {chapter_id!r}")
+    _require(reviewer_id != translation_owner_id, "reviewer_id must differ from translation_owner_id")
+    if unit_ids is None:
+        units = chapter_units
+    else:
+        _require(isinstance(unit_ids, list) and len(unit_ids) == len(set(unit_ids)), "ReviewTask unit_ids must be a unique list")
+        selected = set(unit_ids)
+        _require(selected and selected <= {unit.id for unit in chapter_units}, "ReviewTask unit_ids must belong to the chapter")
+        units = [unit for unit in chapter_units if unit.id in selected]
     _require(all(unit.target_text and unit.translation_status == "translated" for unit in units), "ReviewTask requires a complete current translation")
     target_units = [{"unit_id": unit.id, "target_text": unit.target_text or ""} for unit in units]
     task = {
@@ -502,6 +513,7 @@ def validate_review_task(task: dict) -> None:
     for key in ("task_id", "chapter_id", "reviewer_id", "translation_owner_id"):
         _require(_is_id(task.get(key)), f"ReviewTask {key} is required")
     _require(_valid_uuid(task["task_id"]), "ReviewTask task_id must be a UUID")
+    _require(task["reviewer_id"] != task["translation_owner_id"], "reviewer_id must differ from translation_owner_id")
     _require(_valid_hash(task.get("base_chapter_digest")) and _valid_hash(task.get("target_digest")), "ReviewTask digests are invalid")
     _require(isinstance(task.get("source_units"), list) and isinstance(task.get("target_units"), list), "ReviewTask units must be arrays")
     _require(isinstance(task.get("rubric"), str) and isinstance(task.get("context_capsule"), dict) and isinstance(task.get("required_evidence_schema"), dict), "ReviewTask contract fields are invalid")
@@ -521,6 +533,7 @@ def validate_review_evidence(evidence: dict, task: dict) -> None:
     _require(set(evidence) == {"schema_version", "task_id", "chapter_id", "reviewer_id", "translation_owner_id", "base_chapter_digest", "target_digest", "issues", "summary"}, "ReviewEvidence contains unknown or missing fields")
     for key in ("task_id", "chapter_id", "reviewer_id", "translation_owner_id", "base_chapter_digest", "target_digest"):
         _require(evidence.get(key) == task[key], f"ReviewEvidence {key} does not match task")
+    _require(evidence["reviewer_id"] != evidence["translation_owner_id"], "reviewer_id must differ from translation_owner_id")
     _require(isinstance(evidence.get("issues"), list) and isinstance(evidence.get("summary"), str), "ReviewEvidence issues/summary are invalid")
     known_ids = {unit["unit_id"] for unit in task["source_units"]}
     categories = set(SCHEMAS["ReviewEvidence"]["properties"]["issues"]["items"]["properties"]["category"]["enum"])
@@ -529,3 +542,20 @@ def validate_review_evidence(evidence: dict, task: dict) -> None:
         _require(isinstance(issue, dict) and set(issue) == {"unit_id", "category", "severity", "description", "suggested_fix"} and _is_id(issue.get("unit_id")) and issue["unit_id"] in known_ids, "ReviewEvidence issue refers to an unknown unit or has invalid fields")
         _require(issue.get("category") in categories and issue.get("severity") in severities, "ReviewEvidence issue category or severity is invalid")
         _require(_is_id(issue.get("description")) and isinstance(issue.get("suggested_fix"), str), "ReviewEvidence issue fields are invalid")
+
+
+def validate_review_evidence_current(project: Path, evidence: dict, task: dict) -> None:
+    project = project.resolve(strict=True)
+    validate_review_evidence(evidence, task)
+    document = Document.from_dict(read_json(project / "work" / "document.json"))
+    if chapter_digest(document, task["chapter_id"]) != task["base_chapter_digest"]:
+        raise PatchConflict("STALE_REVIEW_TASK: chapter changed since review task export")
+    current = {unit.id: unit for unit in document.units if unit.section_id == task["chapter_id"]}
+    current_targets = []
+    for source, target in zip(task["source_units"], task["target_units"], strict=True):
+        unit = current.get(source["unit_id"])
+        _require(unit is not None and unit.source_hash == source["source_hash"], "STALE_REVIEW_TASK: source unit changed")
+        _require(unit.target_text is not None and unit.target_text == target["target_text"], "STALE_REVIEW_EVIDENCE: current target changed")
+        current_targets.append({"unit_id": unit.id, "target_text": unit.target_text})
+    if review_target_digest(current_targets) != task["target_digest"]:
+        raise PatchConflict("STALE_REVIEW_EVIDENCE: current target digest changed")

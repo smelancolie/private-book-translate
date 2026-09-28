@@ -7,6 +7,7 @@ import sys
 
 from private_translate.core.pipeline import (
     DEFAULT_AGENT_MODEL,
+    DEFAULT_AGENT_REVIEW_MODEL,
     AgentExecutor,
     assert_project_source_current,
     build_project,
@@ -37,6 +38,9 @@ def parser() -> argparse.ArgumentParser:
             command.add_argument("--model")
             command.add_argument("--translation-backend", type=int, choices=(1, 2), default=1, help="1=Agent, 2=API (default: 1)")
             command.add_argument("--agent-model", default=DEFAULT_AGENT_MODEL)
+            command.add_argument("--review-backend", type=int, choices=(1, 2), default=2, help="1=Agent, 2=API (default: 2)")
+            command.add_argument("--review-model", default=DEFAULT_AGENT_REVIEW_MODEL)
+            command.add_argument("--allow-review-fallback", action="store_true", help="allow Agent chapter review to fall back to API when unavailable")
     spotcheck = commands.add_parser("spotcheck", help="generate a stratified review sample for the current run")
     spotcheck.add_argument("project", type=Path)
     spotcheck.add_argument("--seed", type=int)
@@ -44,7 +48,10 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def main(argv: list[str] | None = None, *, agent_executor: AgentExecutor | None = None) -> int:
+def main(
+    argv: list[str] | None = None, *, agent_executor: AgentExecutor | None = None,
+    review_executor: AgentExecutor | None = None,
+) -> int:
     args = parser().parse_args(argv)
     if args.command == "init":
         project = create_project(args.input_file, args.projects_dir, args.source_language, args.target_language)
@@ -76,7 +83,9 @@ def main(argv: list[str] | None = None, *, agent_executor: AgentExecutor | None 
             outputs = run_project(
                 args.project, base_url=args.base_url, model=args.model, bilingual=args.bilingual,
                 translation_backend=args.translation_backend, agent_executor=agent_executor,
-                agent_model=args.agent_model,
+                agent_model=args.agent_model, review_backend=args.review_backend,
+                review_executor=review_executor, review_model=args.review_model,
+                allow_review_fallback=args.allow_review_fallback,
             )
             print("\n".join(str(path) for path in outputs))
         elif args.command == "build":
