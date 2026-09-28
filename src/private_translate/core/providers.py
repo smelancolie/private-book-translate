@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Any, Protocol
 import json
 import os
@@ -10,7 +11,19 @@ from urllib.request import Request, urlopen
 from .model import TranslationUnit
 
 
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    provider_name: str
+    model: str
+    max_context_tokens: int
+    max_output_tokens: int
+    supports_json_mode: bool
+    supports_parallel_requests: bool
+
+
 class TranslationProvider(Protocol):
+    capabilities: ProviderCapabilities
+
     def translate(
         self, units: list[TranslationUnit], context: str, glossary: list[dict[str, str]], config: dict[str, Any]
     ) -> dict[str, str]: ...
@@ -26,15 +39,24 @@ class OpenAICompatibleProvider:
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
         self.timeout = timeout
+        self.capabilities = ProviderCapabilities(
+            "openai-compatible", model,
+            int(os.environ.get("PRIVATE_TRANSLATE_MAX_CONTEXT_TOKENS", 8192)),
+            int(os.environ.get("PRIVATE_TRANSLATE_MAX_OUTPUT_TOKENS", 2048)),
+            True, False,
+        )
         if not self.api_key:
             raise ValueError("Set OPENAI_API_KEY in the environment")
 
-    def _complete(self, system: str, user: str) -> str:
-        body = json.dumps({
+    def _complete(self, system: str, user: str, max_output_tokens: int) -> str:
+        request_body = {
             "model": self.model,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "response_format": {"type": "json_object"},
-        }).encode("utf-8")
+            "max_tokens": min(max_output_tokens, self.capabilities.max_output_tokens),
+        }
+        if self.capabilities.supports_json_mode:
+            request_body["response_format"] = {"type": "json_object"}
+        body = json.dumps(request_body).encode("utf-8")
         request = Request(
             f"{self.base_url}/chat/completions",
             data=body,
@@ -67,6 +89,7 @@ class OpenAICompatibleProvider:
                 "units": [{"id": unit.id, "text": unit.source_text} for unit in units],
                 "required_output": {"translations": [{"id": "unit id", "target_text": "translation"}]},
             }, ensure_ascii=False),
+            config["provider_limits"]["max_output_tokens"],
         ))
         translations = {row["id"]: row["target_text"] for row in response["translations"]}
         if set(translations) != {unit.id for unit in units}:
@@ -82,5 +105,6 @@ class OpenAICompatibleProvider:
                 "context": context,
                 "required_output": {"issues": [{"unit_id": "unit id", "severity": "P1", "description": "issue"}]},
             }, ensure_ascii=False),
+            config["provider_limits"]["max_output_tokens"],
         ))
         return response["issues"]

@@ -9,9 +9,10 @@ from urllib.parse import unquote, urlsplit
 
 from private_translate.formats.markdown import MarkdownAdapter
 from private_translate.formats.epub import EpubAdapter
-from .glossary import load_glossary
+from .glossary import load_glossary, prepare_terminology
 from .language import load_language_package
 from .model import Document
+from .batching import maximum_unit_tokens, split_oversized_units, translation_batches
 from .providers import OpenAICompatibleProvider, TranslationProvider
 from .qa import run_book_consistency, run_chapter_qa, validate_qa
 from .spotcheck import validate_spotcheck
@@ -26,7 +27,7 @@ def _load_project(project: Path):
     return project, manifest, document
 
 
-def _provider(base_url: str | None, model: str | None) -> TranslationProvider:
+def _provider(base_url: str | None, model: str | None, language: dict) -> TranslationProvider:
     endpoint = base_url or os.environ.get("PRIVATE_TRANSLATE_BASE_URL", "https://api.openai.com/v1")
     selected_model = model or os.environ.get("PRIVATE_TRANSLATE_MODEL")
     if not selected_model:
@@ -39,28 +40,36 @@ def _adapter(format_name: str):
 
 
 def _pending_by_section(document: Document):
+    pending_by_section = {}
+    for unit in document.units:
+        if unit.translatable and (unit.target_text is None or unit.translation_status != "translated"):
+            pending_by_section.setdefault(unit.section_id, []).append(unit)
     for section in document.sections:
-        pending = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable and (unit.target_text is None or unit.translation_status != "translated")]
+        pending = pending_by_section.get(section.section_id, [])
         if pending:
             yield section, pending
 
 
 def _translate(document: Document, project: Path, provider: TranslationProvider, language: dict, glossary: list[dict[str, str]]) -> None:
     for section, units in _pending_by_section(document):
-        context = json.dumps({"section": section.title, "glossary": glossary}, ensure_ascii=False)
+        context = json.dumps({"section": section.title}, ensure_ascii=False)
         try:
-            translations = provider.translate(units, context, glossary, language)
+            for batch, batch_context, batch_glossary in translation_batches(units, provider, language, context, glossary):
+                translations = provider.translate(batch, batch_context, batch_glossary, language)
+                if set(translations) != {unit.id for unit in batch}:
+                    raise ValueError("Provider response must contain exactly one translation per requested unit")
+                for unit in batch:
+                    unit.target_text = translations[unit.id]
+                    unit.translation_status = "translated"
+                    unit.qa_status = "pending"
+                    unit.last_qa_target_hash = None
+                    unit.last_error = None
         except Exception as error:
             for unit in units:
-                unit.last_error = str(error)
+                if unit.target_text is None or unit.translation_status != "translated":
+                    unit.last_error = str(error)
             write_json(project / "work" / "document.json", document.to_dict())
             raise
-        for unit in units:
-            unit.target_text = translations[unit.id]
-            unit.translation_status = "translated"
-            unit.qa_status = "pending"
-            unit.last_qa_target_hash = None
-            unit.last_error = None
         write_json(project / "work" / "document.json", document.to_dict())
 
 
@@ -93,7 +102,11 @@ def _copy_markdown_assets(project: Path, document: Document) -> None:
 
 def _assert_source_current(project: Path, manifest: dict, document: Document, adapter) -> None:
     source = adapter.import_file(project / manifest["source_file"], manifest["source_language"], manifest["target_language"])
-    if {unit.id: unit.source_hash for unit in source.units} != {unit.id: unit.source_hash for unit in document.units}:
+    if (
+        source.source_file_sha256 != document.source_file_sha256
+        or source.source_fingerprint != document.source_fingerprint
+        or source.structure_fingerprint != document.structure_fingerprint
+    ):
         raise ValueError("Source changed since the current translation state; resume before building")
 
 
@@ -133,12 +146,14 @@ def run_project(project: Path, *, base_url: str | None = None, model: str | None
         manifest["bilingual"] = True
         write_json(project / "project.json", manifest)
     language = load_language_package(manifest["source_language"], manifest["target_language"])
+    active_provider = provider or _provider(base_url, model, language)
     source_path = project / manifest["source_file"]
     fresh = _adapter(manifest["format"]).import_file(source_path, manifest["source_language"], manifest["target_language"])
+    split_oversized_units(fresh, maximum_unit_tokens(active_provider, language))
     if saved is not None:
         fresh = merge_saved_state(fresh, saved)
     write_json(project / "work" / "document.json", fresh.to_dict())
-    active_provider = provider or _provider(base_url, model)
+    prepare_terminology(project, fresh, active_provider, language)
     glossary = load_glossary(project / "glossary" / "terms.csv")
     _translate(fresh, project, active_provider, language, glossary)
     run_chapter_qa(project, fresh, active_provider, language, glossary)

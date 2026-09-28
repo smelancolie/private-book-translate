@@ -1,0 +1,1 @@
+Use contextual polysemy review to resolve words from the local sentence and supplied chapter context. Distinguish literal and figurative senses, technical and everyday meanings, and context-dependent grammatical roles. If the source remains genuinely ambiguous, preserve that ambiguity rather than selecting an unsupported interpretation.

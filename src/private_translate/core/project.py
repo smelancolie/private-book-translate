@@ -3,9 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import uuid
 from urllib.parse import unquote, urlsplit
 
+from .glossary import FIELDS
 from .state import write_json
 
 
@@ -33,6 +35,7 @@ def create_project(source_path: Path, projects_dir: Path, source_language: str =
         EpubAdapter().import_file(source_path, source_language, target_language)
     staging.mkdir()
     try:
+        (staging / ".gitignore").write_text("*\n!.gitignore\n", encoding="utf-8")
         source_dir = staging / "source"
         source_dir.mkdir()
         for directory in ("work", "glossary", "qa", "state", "output"):
@@ -58,9 +61,22 @@ def create_project(source_path: Path, projects_dir: Path, source_language: str =
             "bilingual": False,
             "source_file": f"source/{source_path.name}",
         })
-        (staging / "glossary" / "terms.csv").write_text(
-            "source,preferred_translation,category,approved,forbidden_translations\n", encoding="utf-8"
-        )
+        glossary_header = ",".join(FIELDS) + "\n"
+        (staging / "glossary" / "terms.csv").write_text(glossary_header, encoding="utf-8")
+        (staging / "glossary" / "candidates.csv").write_text(glossary_header, encoding="utf-8")
+        if shutil.which("git"):
+            git_root = subprocess.run(
+                ["git", "-C", str(staging), "rev-parse", "--show-toplevel"],
+                capture_output=True, text=True,
+            )
+            if git_root.returncode == 0:
+                relative_private_path = (staging / "work" / "private-state.json").relative_to(git_root.stdout.strip())
+                ignored = subprocess.run(
+                    ["git", "-C", git_root.stdout.strip(), "check-ignore", "--quiet", "--no-index", "--", relative_private_path.as_posix()]
+                )
+                if ignored.returncode == 1:
+                    raise ValueError(f"Private project workspace is not ignored by Git: {project}")
+                ignored.check_returncode()
         staging.rename(project)
         return project
     except BaseException:

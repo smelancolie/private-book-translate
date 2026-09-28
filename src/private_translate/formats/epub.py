@@ -12,7 +12,7 @@ from urllib.parse import unquote, urlsplit
 
 from lxml import etree
 
-from private_translate.core.model import AssetReference, Document, Section, TranslationUnit, content_hash
+from private_translate.core.model import AssetReference, Document, Section, TranslationUnit, content_hash, content_hash_bytes, update_document_fingerprints
 
 
 CONTAINER = "META-INF/container.xml"
@@ -39,7 +39,8 @@ def _is_block(element) -> bool:
     if _local(element) in BLOCKS:
         return True
     semantics = " ".join(value for key, value in element.attrib.items() if etree.QName(key).localname in {"type", "role", "class"})
-    return _local(element) in {"aside", "div", "section"} and bool(re.search(r"(?:footnote|endnote|doc-noteref|doc-footnote|doc-endnote)", semantics, re.I))
+    direct_text = bool((element.text or "").strip() or any((child.tail or "").strip() for child in element))
+    return _local(element) in {"aside", "div", "section"} and (direct_text or bool(re.search(r"(?:footnote|endnote|doc-noteref|doc-footnote|doc-endnote)", semantics, re.I)))
 
 
 def _text(value) -> str:
@@ -103,6 +104,14 @@ def _append_text(parent, value: str) -> None:
         parent[-1].tail = (parent[-1].tail or "") + value
     else:
         parent.text = (parent.text or "") + value
+
+
+def _element_structure(element):
+    return {
+        "tag": element.tag,
+        "attributes": sorted(element.attrib.items()),
+        "children": [_element_structure(child) for child in element if isinstance(child.tag, str)],
+    }
 
 
 def _encode_block(element) -> tuple[str, list[dict]]:
@@ -215,12 +224,46 @@ def _set_language(root, language: str) -> None:
     root.set(xml_lang, language)
 
 
+def _set_package_languages(package, source_language: str, target_language: str, bilingual: bool) -> None:
+    metadata = package.xpath(".//*[local-name()='metadata'][1]")[0]
+    nodes = metadata.xpath("./*[local-name()='language']")
+    first_position = min((list(metadata).index(node) for node in nodes), default=len(metadata))
+    by_language = {}
+    for node in nodes:
+        value = (node.text or "").strip()
+        if value:
+            by_language.setdefault(value.casefold(), node)
+
+    if bilingual:
+        primary = []
+        for value in (source_language, target_language):
+            node = by_language.pop(value.casefold(), None)
+            if node is None:
+                node = etree.Element(nodes[0].tag if nodes else "{http://purl.org/dc/elements/1.1/}language")
+            node.text = value
+            primary.append(node)
+    else:
+        target_node = by_language.pop(target_language.casefold(), None)
+        source_node = by_language.pop(source_language.casefold(), None)
+        node = target_node if target_node is not None else source_node
+        if node is None:
+            node = etree.Element(nodes[0].tag if nodes else "{http://purl.org/dc/elements/1.1/}language")
+        node.text = target_language
+        primary = [node]
+
+    for node in nodes:
+        metadata.remove(node)
+    for offset, node in enumerate([*primary, *by_language.values()]):
+        metadata.insert(first_position + offset, node)
+
+
 class EpubAdapter:
     def import_file(self, path: Path, source_language: str, target_language: str) -> Document:
         with zipfile.ZipFile(path) as archive:
             names = [entry.filename for entry in archive.infolist()]
             if len(names) != len(set(names)):
                 raise ValueError("EPUB contains duplicate archive member names")
+            archive_paths = set(names)
             obfuscated_fonts = _obfuscated_font_paths(archive)
             if "mimetype" not in names or CONTAINER not in names:
                 raise ValueError("EPUB is missing mimetype or META-INF/container.xml")
@@ -254,10 +297,11 @@ class EpubAdapter:
             units: list[TranslationUnit] = []
             spine_path_ids = {manifest[item_id]["path"]: index for index, item_id in enumerate(spine_ids)}
 
-            def add(text: str, section_id: str, locator: dict, kind: str, metadata=None, translatable: bool | None = None):
+            def add(text: str, section_id: str, locator: dict, kind: str, metadata=None, translatable: bool | None = None, structural_data=None):
                 translatable = any(char.isalpha() for char in text) if translatable is None else translatable
                 unit = TranslationUnit.create(section_id=section_id, type=kind, source_text=text, translatable=translatable,
-                    source_language=source_language, target_language=target_language, locator=locator, metadata=metadata)
+                    source_language=source_language, target_language=target_language, locator=locator, metadata=metadata,
+                    structural_data=structural_data)
                 if not translatable:
                     unit.target_text = text
                     unit.translation_status = "translated"
@@ -291,7 +335,8 @@ class EpubAdapter:
                     tag = _local(element)
                     if tag == "math":
                         add(etree.tostring(element, encoding="unicode"), section_id,
-                            {"kind": "epub_opaque", "item_path": item_path, "xpath": _xpath(element)}, "formula", translatable=False)
+                            {"kind": "epub_opaque", "item_path": item_path, "xpath": _xpath(element)}, "formula", translatable=False,
+                            structural_data=_element_structure(element))
                         continue
                     if tag in HIDDEN or not isinstance(element.tag, str):
                         continue
@@ -301,11 +346,67 @@ class EpubAdapter:
                         if plain:
                             add(encoded, section_id, {"kind": "epub_block", "item_path": item_path, "xpath": _xpath(element)},
                                 "heading" if tag.startswith("h") or tag == "title" else "table" if tag in {"td", "th", "caption"} else "caption_note" if tag == "figcaption" else "paragraph",
-                                {"marks": marks, "tag": tag}, any(char.isalpha() for char in plain))
+                                {"marks": marks, "tag": tag}, any(char.isalpha() for char in plain), _element_structure(element))
                     for attribute in TRANSLATABLE_ATTRIBUTES:
                         value = element.get(attribute)
                         if value and any(char.isalpha() for char in value):
-                            add(value, section_id, {"kind": "epub_attribute", "item_path": item_path, "xpath": _xpath(element), "attribute": attribute}, "caption_note")
+                            add(value, section_id, {"kind": "epub_attribute", "item_path": item_path, "xpath": _xpath(element), "attribute": attribute}, "caption_note",
+                                structural_data=_element_structure(element))
+                    if tag == "img":
+                        asset_ref = element.get("src") or element.get("{http://www.w3.org/1999/xlink}href") or ""
+                        parsed_ref = urlsplit(asset_ref)
+                        asset_path = _resolve_href(item_path, asset_ref) if asset_ref and not parsed_ref.scheme and not parsed_ref.netloc else asset_ref
+                        if asset_path and asset_path in archive_paths:
+                            asset_hash = content_hash_bytes(archive.read(asset_path))
+                        else:
+                            asset_hash = content_hash(asset_ref)
+                        figure_path = element.xpath("ancestor-or-self::*[local-name()='figure'][1]")
+                        figure_root = figure_path[0] if figure_path else element
+                        add(element.get("alt", ""), section_id,
+                            {"kind": "epub_figure", "item_path": item_path, "xpath": _xpath(element)}, "figure",
+                            {"asset_path": asset_path, "asset_hash": asset_hash, "alt": element.get("alt", ""),
+                             "caption_unit_ids": [], "surrounding_unit_ids": [], "surrounding_text": []},
+                            False, _element_structure(figure_root))
+
+            previous_by_index = {}
+            previous_translatable = None
+            for index, unit in enumerate(units):
+                if unit.type == "figure":
+                    previous_by_index[index] = previous_translatable
+                if unit.translatable:
+                    previous_translatable = unit
+            following_by_index = {}
+            following_translatable = None
+            for index in range(len(units) - 1, -1, -1):
+                unit = units[index]
+                if unit.type == "figure":
+                    following_by_index[index] = following_translatable
+                if unit.translatable:
+                    following_translatable = unit
+            units_by_location = {
+                (unit.locator.get("item_path"), unit.locator.get("xpath")): unit
+                for unit in units if unit.locator.get("kind") == "epub_block"
+            }
+            for index, unit in enumerate(units):
+                if unit.type != "figure":
+                    continue
+                figure_node = xhtml[unit.locator["item_path"]].xpath(unit.locator["xpath"])[0]
+                figure_path = figure_node.xpath("ancestor-or-self::*[local-name()='figure'][1]")
+                figure_root = figure_path[0] if figure_path else figure_node
+                caption_paths = {
+                    _xpath(caption) for caption in figure_root.xpath(".//*[local-name()='figcaption']")
+                }
+                unit.metadata["caption_unit_ids"] = [
+                    units_by_location[(unit.locator["item_path"], caption_path)].id
+                    for caption_path in caption_paths
+                    if (unit.locator["item_path"], caption_path) in units_by_location
+                ]
+                neighbors = [
+                    candidate for candidate in (previous_by_index[index], following_by_index[index])
+                    if candidate is not None and candidate.section_id == unit.section_id
+                ]
+                unit.metadata["surrounding_unit_ids"] = [candidate.id for candidate in neighbors]
+                unit.metadata["surrounding_text"] = [candidate.source_text for candidate in neighbors]
 
             dc_titles = package.xpath(".//*[local-name()='metadata']/*[local-name()='title']")
             if dc_titles:
@@ -316,11 +417,13 @@ class EpubAdapter:
                     if value:
                         add(value, metadata_section, {"kind": "epub_title", "item_path": package_path, "xpath": _xpath(element), "index": index}, "heading")
 
-            assets = [AssetReference(item["path"], item["media_type"] or "application/octet-stream", content_hash(item["path"]))
+            assets = [AssetReference(item["path"], item["media_type"] or "application/octet-stream", content_hash_bytes(archive.read(item["path"])))
                 for item in manifest.values() if item["media_type"] != "application/xhtml+xml"]
-            return Document("epub", source_language, target_language,
+            document = Document("epub", source_language, target_language,
                 {"title": _text(dc_titles[0]).strip() if dc_titles else Path(path).stem, "format": "epub", "package_path": package_path},
                 sections, units, assets, {"spine": spine_ids, "nav_path": nav_path, "manifest": manifest})
+            update_document_fingerprints(document, path)
+            return document
 
     def render(self, document: Document, output_path: Path, bilingual: bool = False, source_path: Path | None = None) -> Path:
         if source_path is None:
@@ -363,6 +466,21 @@ class EpubAdapter:
                         _replace_block(element, unit.target_text, unit.metadata["marks"], refs)
                     elif _local(element) == "title":
                         element.text = f"{unit.source_text} — {unit.target_text}"
+                    elif _local(element) in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+                        clone = deepcopy(element)
+                        _replace_block(clone, unit.target_text, unit.metadata["marks"], refs, copy_kept=True)
+                        for copied in [clone, *clone.iterdescendants()]:
+                            for attribute in list(copied.attrib):
+                                if etree.QName(attribute).localname == "id":
+                                    copied.attrib.pop(attribute, None)
+                        target_span = etree.Element(f"{{{etree.QName(element).namespace}}}span")
+                        target_span.text = clone.text
+                        for child in list(clone):
+                            clone.remove(child)
+                            target_span.append(child)
+                        _set_language(target_span, target_language)
+                        _append_text(element, " — ")
+                        element.append(target_span)
                     else:
                         clone = deepcopy(element)
                         _replace_block(clone, unit.target_text, unit.metadata["marks"], refs, copy_kept=True)
@@ -396,17 +514,14 @@ class EpubAdapter:
                     _set_language(root, target_language)
                 updates[item_path] = etree.tostring(root, encoding="utf-8", xml_declaration=True, doctype=root.getroottree().docinfo.doctype or None)
 
-            if package_path in names and any(unit.locator.get("kind") == "epub_title" for unit in document.units):
+            if package_path in names:
                 package = etree.fromstring(source.read(package_path), _parser())
                 for unit in document.units:
                     if unit.locator.get("kind") != "epub_title" or unit.target_text is None:
                         continue
                     title = package.xpath(unit.locator["xpath"])[0]
                     title.text = f"{unit.source_text} — {unit.target_text}" if bilingual else unit.target_text
-                if not bilingual:
-                    for language in package.xpath(".//*[local-name()='metadata']/*[local-name()='language']"):
-                        if (language.text or "").strip() == document.source_language:
-                            language.text = target_language
+                _set_package_languages(package, document.source_language, target_language, bilingual)
                 updates[package_path] = etree.tostring(package, encoding="utf-8", xml_declaration=True, doctype=package.getroottree().docinfo.doctype or None)
 
             with zipfile.ZipFile(output_path, "w") as result:

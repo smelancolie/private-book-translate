@@ -13,4 +13,4 @@ dependencies = ["lxml>=5"]
 translate = "private_translate.cli:main"
 
 [tool.setuptools.package-data]
-private_translate = ["languages/**/*.json"]
+private_translate = ["languages/**/*.json", "languages/**/*.md"]

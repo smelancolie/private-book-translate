@@ -1,0 +1,1 @@
+Keep personal names, place names, organizations, and named works consistent. Use a natural established Chinese form when clear; otherwise transliterate consistently and do not invent titles, affiliations, or biographical details. Preserve names that the source intentionally leaves untranslated.

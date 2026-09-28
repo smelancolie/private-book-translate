@@ -1,0 +1,1 @@
+Preserve literary voice, register, point of view, emphasis, and rhythm. For nonfiction, retain precise terminology and argument structure. Preserve quotations and notes without turning them into commentary. Keep every source paragraph complete and aligned with its own target paragraph.

@@ -5,9 +5,11 @@ import unittest
 from private_translate.core.pipeline import build_project, run_project, validate_project
 from private_translate.core.project import create_project
 from private_translate.core.model import Document, Section, TranslationUnit, content_hash
+from private_translate.core.providers import ProviderCapabilities
 from private_translate.core.qa import run_chapter_qa
 from private_translate.core.spotcheck import create_spotcheck_round
 from private_translate.core.state import read_json, write_json
+from private_translate.formats.markdown import MarkdownAdapter
 
 
 def approve_current_spotcheck(project, seeds):
@@ -24,6 +26,7 @@ def approve_current_spotcheck(project, seeds):
 
 
 class ExampleProvider:
+    capabilities = ProviderCapabilities("fake", "test", 116000, 16000, True, False)
     translations = {
         "A Small Book": "一本小书",
         "The story begins with": "故事从",
@@ -37,6 +40,9 @@ class ExampleProvider:
         "Ada": "艾达",
         "A person": "一个人",
         "See the": "参见",
+        "Chapter One": "第一章",
+        "Preface text before the first heading.": "首个标题前的序言。",
+        "Preface with front matter.": "带有前置元数据的序言。",
         "A short footnote.": "简短脚注。",
         "Readable HTML block text.": "可读的 HTML 块文本。",
     }
@@ -61,6 +67,90 @@ class ExampleProvider:
 
 
 class MarkdownPipelineTests(unittest.TestCase):
+    def test_markdown_text_before_first_heading_is_translated(self):
+        repo = Path(__file__).parents[1]
+        root = repo / ".test-tmp" / "markdown-preamble"
+        if root.exists():
+            self.assertTrue(root.resolve().is_relative_to(repo.resolve()))
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        source = root / "preamble.md"
+        source.write_text("Preface text before the first heading.\n\n# Chapter One\n\nChapter body.\n", encoding="utf-8")
+        project = create_project(source, root / "projects")
+
+        output = run_project(project, provider=ExampleProvider())[0].read_text(encoding="utf-8")
+
+        self.assertIn("首个标题前的序言。", output)
+        document = Document.from_dict(read_json(project / "work" / "document.json"))
+        preamble = next(section for section in document.sections if section.section_id == "section-0000")
+        self.assertEqual(preamble.title, "Preamble")
+        self.assertTrue(any(unit.section_id == preamble.section_id and unit.translation_status == "translated" for unit in document.units))
+        shutil.rmtree(root)
+
+    def test_markdown_frontmatter_preamble_and_heading_have_sections(self):
+        repo = Path(__file__).parents[1]
+        root = repo / ".test-tmp" / "markdown-frontmatter-preamble"
+        if root.exists():
+            self.assertTrue(root.resolve().is_relative_to(repo.resolve()))
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        source = root / "preamble.md"
+        source.write_text("---\ntitle: A Small Book\n---\n\nPreface with front matter.\n\n# Chapter One\n\nChapter body.\n", encoding="utf-8")
+        project = create_project(source, root / "projects")
+
+        output = run_project(project, provider=ExampleProvider())[0].read_text(encoding="utf-8")
+
+        self.assertIn("title: 一本小书", output)
+        self.assertIn("带有前置元数据的序言。", output)
+        document = Document.from_dict(read_json(project / "work" / "document.json"))
+        self.assertEqual([section.section_id for section in document.sections[:3]], ["frontmatter", "section-0000", "section-0001"])
+        shutil.rmtree(root)
+
+    def test_bilingual_markdown_keeps_only_source_heading_id(self):
+        repo = Path(__file__).parents[1]
+        root = repo / ".test-tmp" / "markdown-bilingual-heading-id"
+        if root.exists():
+            self.assertTrue(root.resolve().is_relative_to(repo.resolve()))
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        source = root / "linked-heading.md"
+        source.write_text("# Chapter One {#chapter-one}\n\nSee [chapter](#chapter-one).\n", encoding="utf-8")
+        project = create_project(source, root / "projects")
+
+        bilingual_path = run_project(project, bilingual=True, provider=ExampleProvider())[1]
+        bilingual = bilingual_path.read_text(encoding="utf-8")
+        rendered = MarkdownAdapter().import_file(bilingual_path, "en", "zh-Hans")
+        header_ids = [block["c"][1][0] for block in rendered.structure["pandoc"]["blocks"] if block.get("t") == "Header"]
+
+        self.assertEqual(header_ids.count("chapter-one"), 1)
+        self.assertRegex(bilingual, r"\]\(#chapter-one\)")
+        shutil.rmtree(root)
+
+    def test_markdown_import_creates_figure_audit_unit(self):
+        from private_translate.core.spotcheck import _eligible_units
+
+        repo = Path(__file__).parents[1]
+        root = repo / ".test-tmp" / "markdown-figure-unit"
+        if root.exists():
+            self.assertTrue(root.resolve().is_relative_to(repo.resolve()))
+            shutil.rmtree(root)
+        root.mkdir(parents=True)
+        (root / "assets").mkdir()
+        (root / "assets" / "cover.png").write_bytes(b"private-figure-bytes")
+        source = root / "figures.md"
+        source.write_text("A cover illustration: ![Blue cover](assets/cover.png)\n", encoding="utf-8")
+
+        document = MarkdownAdapter().import_file(source, "en", "zh-Hans")
+        figure = next(unit for unit in document.units if unit.type == "figure")
+
+        self.assertFalse(figure.translatable)
+        self.assertEqual(figure.metadata["asset_path"], "assets/cover.png")
+        self.assertTrue(figure.metadata["asset_hash"])
+        self.assertEqual(figure.metadata["alt"], "Blue cover")
+        self.assertTrue(figure.metadata["surrounding_unit_ids"])
+        self.assertIn(figure, _eligible_units(document)["figure"])
+        shutil.rmtree(root)
+
     def test_markdown_target_and_bilingual_outputs_and_resume(self):
         repo = Path(__file__).parents[1]
         root = repo / ".test-tmp" / "markdown-vertical-slice"
@@ -135,6 +225,7 @@ class MarkdownPipelineTests(unittest.TestCase):
 
         class FailsOnce:
             calls = 0
+            capabilities = ProviderCapabilities("fake", "test", 116000, 16000, True, False)
 
             def translate(self, units, context, glossary, config):
                 self.calls += 1
@@ -183,6 +274,7 @@ class MarkdownPipelineTests(unittest.TestCase):
         document = Document("markdown", "en", "zh-Hans", {}, [Section("section-0001", "Chapter", {"path": [0]})], [unit])
 
         class FixingProvider:
+            capabilities = ProviderCapabilities("fake", "test", 116000, 16000, True, False)
             reviews = 0
 
             def review(self, source, target, context, rubric, config):
@@ -197,6 +289,10 @@ class MarkdownPipelineTests(unittest.TestCase):
         language = {
             "review_rubric": "Review the full chapter.",
             "translation_prompt": "Translate while preserving markers.",
+            "provider_limits": {
+                "max_context_tokens": 116000, "max_input_tokens": 100000, "max_output_tokens": 16000,
+                "translation_batch_target_tokens": 12000, "review_batch_target_tokens": 16000,
+            },
         }
         run_chapter_qa(root, document, FixingProvider(), language, [])
         rounds = read_json(root / "qa" / "chapter-controls" / "section-0001.json")["rounds"]
@@ -204,6 +300,11 @@ class MarkdownPipelineTests(unittest.TestCase):
         self.assertEqual(rounds[1]["issues_found"], 0)
         self.assertEqual(unit.qa_status, "passed")
         self.assertEqual(unit.last_qa_target_hash, content_hash("修订稿。"))
+        unsupported_evidence = {
+            "expert_translation_skill_used", "expert_level_review_status",
+            "polysemy_translation_stage_review", "polysemy_context_review",
+        }
+        self.assertFalse(unsupported_evidence & set(rounds[1]))
         shutil.rmtree(root)
 
 

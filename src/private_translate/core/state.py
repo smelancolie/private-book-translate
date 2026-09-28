@@ -5,7 +5,8 @@ import os
 from pathlib import Path
 import tempfile
 
-from .model import Document, content_hash
+from .model import Document
+from .reconcile import reconcile_document
 
 
 def write_json(path: Path, value: object) -> None:
@@ -26,25 +27,4 @@ def read_json(path: Path):
 
 
 def merge_saved_state(fresh: Document, saved: Document | None) -> Document:
-    if saved is None:
-        return fresh
-    previous = {unit.id: unit for unit in saved.units}
-    for unit in fresh.units:
-        old = previous.get(unit.id)
-        if old is None:
-            continue
-        if old.source_hash != unit.source_hash:
-            unit.translation_status = "stale"
-            unit.qa_status = "pending"
-            unit.target_text = None
-            unit.last_qa_target_hash = None
-            continue
-        unit.target_text = old.target_text
-        unit.translation_status = old.translation_status
-        unit.qa_status = old.qa_status
-        unit.last_qa_target_hash = old.last_qa_target_hash
-        unit.last_error = old.last_error
-        if unit.target_text is not None and content_hash(unit.target_text) != old.last_qa_target_hash:
-            unit.qa_status = "pending"
-            unit.last_qa_target_hash = None
-    return fresh
+    return reconcile_document(fresh, saved)

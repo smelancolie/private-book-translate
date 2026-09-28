@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlsplit
 
 from lxml import etree, html
 
-from private_translate.core.model import AssetReference, Document, Section, TranslationUnit, content_hash
+from private_translate.core.model import AssetReference, Document, Section, TranslationUnit, content_hash, content_hash_bytes, update_document_fingerprints
 
 
 BLOCK_TEXT_TYPES = {"Header", "Para", "Plain"}
@@ -24,6 +24,7 @@ INLINE_CHILD_PATHS = {
 TOKEN = re.compile(r"⟦(/?)([PK])(\d+)⟧")
 HIDDEN_HTML = {"script", "style", "pre", "code", "svg", "math"}
 HUMAN_HTML_ATTRIBUTES = {"alt", "title", "aria-label"}
+PANDOC_FORMAT = "markdown+header_attributes"
 
 
 def _set_at(value: Any, path: list[int], replacement: Any) -> None:
@@ -207,6 +208,14 @@ def _render_html(wrapper, rows: list[tuple[TranslationUnit, str]]) -> str:
     return out
 
 
+def _html_structure(element):
+    return {
+        "tag": element.tag if isinstance(element.tag, str) else "comment",
+        "attributes": sorted(element.attrib.items()),
+        "children": [_html_structure(child) for child in element],
+    }
+
+
 class MarkdownAdapter:
     def __init__(self, pandoc: str | None = None):
         self.pandoc = pandoc or shutil.which("pandoc")
@@ -220,8 +229,9 @@ class MarkdownAdapter:
         return result.stdout
 
     def import_file(self, path: Path, source_language: str, target_language: str) -> Document:
-        source = path.read_text(encoding="utf-8")
-        ast = json.loads(self._pandoc(["--from=gfm", "--to=json"], source))
+        source_path = path
+        source = source_path.read_text(encoding="utf-8")
+        ast = json.loads(self._pandoc([f"--from={PANDOC_FORMAT}", "--to=json"], source))
         sections: list[Section] = []
         units: list[TranslationUnit] = []
         assets: list[AssetReference] = []
@@ -229,10 +239,13 @@ class MarkdownAdapter:
         active_title = ""
         heading_number = 0
 
-        def add_unit(text: str, locator: dict[str, Any], kind: str, translatable: bool, metadata=None):
+        def add_unit(text: str, locator: dict[str, Any], kind: str, translatable: bool, metadata=None, structural_data=None):
+            if translatable and active_section == "section-0000" and not any(section.section_id == active_section for section in sections):
+                sections.append(Section(active_section, "Preamble", {"path": ["blocks"]}))
             unit = TranslationUnit.create(
                 section_id=active_section, type=kind, source_text=text, translatable=translatable,
                 source_language=source_language, target_language=target_language, locator=locator, metadata=metadata,
+                structural_data=structural_data,
             )
             if not translatable:
                 unit.target_text = text
@@ -282,10 +295,23 @@ class MarkdownAdapter:
             if kind == "Image":
                 target = value.get("c", [None, None, [""]])[2][0]
                 parsed = urlsplit(target)
+                asset_path = None
+                asset_hash = content_hash(target)
                 if target and not parsed.scheme and not parsed.netloc and not target.startswith("/"):
                     suffix = Path(unquote(parsed.path)).suffix.lower()
                     media = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".svg": "image/svg+xml", ".gif": "image/gif", ".webp": "image/webp"}.get(suffix, "application/octet-stream")
-                    assets.append(AssetReference(target, media, content_hash(target), {"path": path}))
+                    asset_path = (source_path.parent / unquote(parsed.path)).resolve(strict=True)
+                    asset_path.relative_to(source_path.parent.resolve())
+                    asset_hash = content_hash_bytes(asset_path.read_bytes())
+                    assets.append(AssetReference(target, media, asset_hash, {"path": path}))
+                alt = _text_inlines(value.get("c", [None, [], None])[1])
+                parent_unit = next((unit for unit in reversed(units) if unit.locator.get("kind") == "block" and tuple(path[:len(unit.locator["path"])]) == tuple(unit.locator["path"])), None)
+                parent_text = re.sub(r"⟦/?[PK]\d+⟧", "", parent_unit.source_text) if parent_unit else ""
+                add_unit(alt, {"kind": "markdown_figure", "path": path}, "figure", False,
+                    {"asset_path": target, "asset_hash": asset_hash, "alt": alt, "caption_unit_ids": [],
+                     "surrounding_unit_ids": [parent_unit.id] if parent_unit else [],
+                     "surrounding_text": [parent_text] if parent_text else []},
+                    {"target": target, "title": value.get("c", [None, None, [None, ""]])[2][1]})
             if kind in {"Image", "Link"}:
                 title = value.get("c", [None, None, [None, ""]])[2][1]
                 if title and any(char.isalpha() for char in title):
@@ -293,7 +319,7 @@ class MarkdownAdapter:
             if kind == "Header":
                 text, marks = _encode_inlines(value["c"][2])
                 plain = _text_inlines(value["c"][2])
-                add_unit(text, {"kind": "block", "path": path}, "heading", any(char.isalpha() for char in plain), {"ast_type": kind, "marks": marks})
+                add_unit(text, {"kind": "block", "path": path}, "heading", any(char.isalpha() for char in plain), {"ast_type": kind, "marks": marks, "block_attributes": value["c"][1]})
             elif kind in {"Para", "Plain"}:
                 text, marks = _encode_inlines(value["c"])
                 plain = _text_inlines(value["c"])
@@ -306,9 +332,9 @@ class MarkdownAdapter:
                 add_unit(value["c"][1], {"kind": "formula", "path": path}, "formula", False, {"ast_type": kind})
                 return
             elif kind == "RawBlock" and value["c"][0].lower() == "html":
-                _, rows = _walk_html(value["c"][1])
+                wrapper, rows = _walk_html(value["c"][1])
                 for xpath, slot, text, unit_type in rows:
-                    add_unit(text, {"kind": "html", "path": path, "html_xpath": xpath, "html_slot": slot}, unit_type, any(char.isalpha() for char in text), {"ast_type": kind})
+                    add_unit(text, {"kind": "html", "path": path, "html_xpath": xpath, "html_slot": slot}, unit_type, any(char.isalpha() for char in text), {"ast_type": kind}, _html_structure(wrapper))
                 return
             for key, child in value.items():
                 if key != "t":
@@ -321,7 +347,9 @@ class MarkdownAdapter:
         if not sections:
             sections.append(Section(active_section, active_title, {"path": ["blocks"]}))
         metadata = {"title": _meta_text(metadata_fields.get("title")), "format": "markdown"}
-        return Document("markdown", source_language, target_language, metadata, sections, units, assets, {"pandoc": ast})
+        document = Document("markdown", source_language, target_language, metadata, sections, units, assets, {"pandoc": ast})
+        update_document_fingerprints(document, source_path)
+        return document
 
     def render(self, document: Document, output_path: Path, bilingual: bool = False) -> Path:
         ast = deepcopy(document.structure["pandoc"])
@@ -368,6 +396,8 @@ class MarkdownAdapter:
                         translated["c"] = _decode_inlines(unit.target_text, marks)
                     translated["c"] = transform(translated["c"], path + ("c",))
                     if bilingual:
+                        if value["t"] == "Header":
+                            translated["c"][1][0] = ""
                         return [deepcopy(value), translated]
                     return translated
                 if value.get("t") == "RawBlock" and value["c"][0].lower() == "html":
@@ -384,13 +414,13 @@ class MarkdownAdapter:
             return value
 
         ast = transform(ast)
-        rendered = self._pandoc(["--from=json", "--to=gfm", "--standalone"], json.dumps(ast, ensure_ascii=False))
+        rendered = self._pandoc(["--from=json", f"--to={PANDOC_FORMAT}", "--standalone"], json.dumps(ast, ensure_ascii=False))
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(rendered, encoding="utf-8", newline="\n")
         return output_path
 
     def validate(self, path: Path) -> None:
-        self._pandoc(["--from=gfm", "--to=json"], path.read_text(encoding="utf-8"))
+        self._pandoc([f"--from={PANDOC_FORMAT}", "--to=json"], path.read_text(encoding="utf-8"))
 
 
 def _meta_text(value: dict[str, Any] | None) -> str:

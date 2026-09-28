@@ -28,9 +28,23 @@ def _eligible_units(document: Document) -> dict[str, list[TranslationUnit]]:
     result = {name: [] for name in STRATA}
     for unit in document.units:
         stratum = _stratum(unit)
-        if stratum and unit.target_text is not None and (unit.translatable or stratum == "formula"):
+        figure_ready = stratum == "figure" and unit.metadata.get("asset_path") and unit.metadata.get("asset_hash")
+        if stratum and unit.target_text is not None and (unit.translatable or stratum == "formula" or figure_ready):
             result[stratum].append(unit)
     return result
+
+
+def _sample_mapping(unit: TranslationUnit) -> dict:
+    mapping = {
+        "unit_id": unit.id, "section_id": unit.section_id, "type": unit.type,
+        "stratum": _stratum(unit), "source_text": unit.source_text,
+        "source_hash": unit.source_hash, "locator": unit.locator,
+    }
+    if unit.type == "figure":
+        mapping.update({key: unit.metadata.get(key, []) for key in (
+            "asset_path", "asset_hash", "alt", "caption_unit_ids", "surrounding_unit_ids", "surrounding_text",
+        )})
+    return mapping
 
 
 def _budget(stratum: str, population: int) -> int:
@@ -85,14 +99,7 @@ def _validate_sample(sample: dict, document: Document, reported_issue_ids: set[s
         raise ValueError("Spot-check sample strata or reviewer assignments do not match the deterministic plan")
     selected = set.union(*(set(ids) for ids in expected_reviewers.values()))
     by_id = {unit.id: unit for units in strata.values() for unit in units}
-    expected_items = {
-        unit_id: {
-            "unit_id": unit_id, "section_id": by_id[unit_id].section_id, "type": by_id[unit_id].type,
-            "stratum": _stratum(by_id[unit_id]), "source_text": by_id[unit_id].source_text,
-            "source_hash": by_id[unit_id].source_hash, "locator": by_id[unit_id].locator,
-        }
-        for unit_id in selected
-    }
+    expected_items = {unit_id: _sample_mapping(by_id[unit_id]) for unit_id in selected}
     observed = {item.get("unit_id"): item for item in sample.get("samples", [])}
     if set(observed) != selected or len(observed) != len(sample.get("samples", [])):
         raise ValueError("Spot-check sample content is stale, incomplete, or modified")
@@ -284,9 +291,8 @@ def create_spotcheck_round(project: Path, document: Document, seed: int | None =
     for unit_id in sorted(selected_ids):
         unit = by_id[unit_id]
         sample_items.append({
-            "unit_id": unit.id, "section_id": unit.section_id, "type": unit.type, "stratum": _stratum(unit),
-            "source_text": unit.source_text, "target_text": unit.target_text,
-            "source_hash": unit.source_hash, "target_hash": content_hash(unit.target_text or ""), "locator": unit.locator,
+            **_sample_mapping(unit), "target_text": unit.target_text,
+            "target_hash": content_hash(unit.target_text or ""),
         })
     number = len(rounds) + 1
     directory = run_dir / f"round-{number:04d}"

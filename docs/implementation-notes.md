@@ -2,15 +2,20 @@
 
 ## Reference snapshot
 
-Checked the public default branch `main` on GitHub on 2026-09-27. The repository page listed 117 commits and showed `219f452` (2026-07-13) as its latest commit. A direct `git ls-remote` attempt could not authenticate because Windows Schannel reported no credentials, so the exact live remote HEAD was not independently confirmed.
+reference_repository: `https://github.com/SaberOnGo/public-domain-books-translation.git`
+reference_branch: `main`
+reference_commit_sha: `7af61d6a485033edeb5c08b2f7e55b763ea59d30`
+reference_checked_at: `2026-09-27T22:48:34Z`
 
-The reference `AGENTS.md` and the current `English-to-Simplified-Chinese` template were read. Its shared pipeline describes stable translation units, hashes, deterministic projections, and alignment. Its chapter gate requires a new zero-issue full review after any fix. Its random review policy uses separate paragraph/table/figure/formula/note strata, defect-family book-wide closure, a new seed after repairs, at least two independent reviewers, a 0.80 confidence target, and a default of two current-run PASS rounds. Review PASS requires each reviewer average >=92, lowest sample >=88, and no style debt.
+The private project `main` and the reference project `main` were refreshed before this round. The reference snapshot above is the checked-out `main` commit, not a repository-page estimate. I read `translation_unit_xliff_policy.md`, `adaptive_parallel_orchestration.md`, `ai_parallel_execution_guidance.md`, `bilingual_parallel_edition_policy.md`, and the persistent-unit, chapter QA, spot-check, defect-family, and bilingual alignment implementations/tests.
 
 ## Reuse and omissions
 
-- Reuse as rules: translation-unit hashes and resume invalidation, approved glossary entries, full chapter fix/recheck semantics, source-to-target alignment, stratified review, and defect-family closure.
-- Rewritten here: canonical model, workspace/state, CLI, provider adapter, Markdown and EPUB adapters, output construction, and QA evidence validation. No reference code is copied.
-- Excluded by design: public-domain discovery, rights evidence, publication/release gates, public/private modes, private-use overlays, Digest, launcher, covers, and compatibility paths for those features.
+- Adopted as rules: persistent translation-unit identity, canonical target text, source/target block alignment, full chapter re-review after fixes, stratified spot-check evidence, and defect-family closure.
+- Implemented locally: UUID unit IDs with source reconciliation; source and structural fingerprints; bounded translation/review batches; chapter-scoped consistency candidates; and aligned target/bilingual rendering. The formats still share one canonical document and QA pipeline.
+- Not adopted: XLIFF 2.1 exchange, because this CLI has no exchange workflow; chapter-scoped compare-and-swap and independent parallel audit ownership, because this pipeline has no concurrent worker patch model; and adaptive runtime orchestration, because it would add a worker launcher absent from the private workflow. Provider calls remain sequential and bounded.
+- Excluded by design: public-domain discovery, rights evidence, publication/release gates, public/private modes, private-use overlays, Digest, launcher, covers, and compatibility paths for those features. No release/publication changes were brought over.
+- No reference implementation code is copied; the private project keeps its own model, state, CLI, provider adapter, Markdown/EPUB adapters, rendering, and QA evidence validation.
 
 The Markdown adapter uses Pandoc's AST JSON interface to preserve parsed block and inline structure. EPUB handling edits only package metadata and XHTML members in the source ZIP; other members and compression settings are carried through, with `mimetype` normalized to the required first/stored entry. Content encryption/DRM is refused; standard font obfuscation entries and font bytes are carried through unchanged. Bilingual EPUB inserts translated blocks without copying IDs; table/list structures remain intact, and navigation labels stay a single translated TOC so its nesting and links stay intact.
 
@@ -27,3 +32,9 @@ The Markdown adapter uses Pandoc's AST JSON interface to preserve parsed block a
 - `translate spotcheck` writes a deterministic seeded sample from paragraph, table, figure, formula, and caption/note strata. Reference thresholds carried into the protocol are a 0.80 confidence target at an assumed 0.10 defect rate; paragraph sample budget is 120 per reviewer/round; tables and figures are full-scan at 80 or fewer, formulas at 100 or fewer, and captions/notes at 120 or fewer, otherwise 20 per stratum/round. Two independent reviewer slots record per-unit 0–100 scores; each average must be at least 92, its lowest score at least 88, and style debt zero.
 - Final validation requires two consecutive PASS rounds in the active current run, each with a different seed; the default run plan allows four rounds. A reported family requires an exact full-book audit of its declared strata, mapped fix/exception records, rerun chapter/book QA, and a new-seed review round. Generated sample plans are recomputed during validation, and source/target hashes must still match their evidence.
 - `run` leaves candidate output in the workspace so a human review can happen; `build` and `validate` enforce the completed current-run sampling gate. Reviewer independence is recorded by distinct reviewer IDs but cannot be authenticated by a local CLI.
+
+## Phase 5 — Privacy and long-book verification
+
+- Every new project workspace contains `.gitignore` (`*` plus an exception for `.gitignore`). When initialized under a Git work tree, creation checks a representative private state path with `git check-ignore` and fails before finalizing the workspace if Git would track it.
+- CI runs the full unittest suite on Python 3.11 and 3.12 with Pandoc installed. A separate optional EPUBCheck job validates a minimal EPUB fixture; the ordinary synthetic EPUB fixtures are not sent through EPUBCheck because they intentionally use placeholder binary assets.
+- `test_large_book_never_sends_full_book_to_provider` creates 100 chapters and 50,000 paragraph units with a local fake provider; it exercises initialization, translation, resume, bounded translation/review requests, consistency occurrence indexing, output build, and two seeded spot-check rounds.

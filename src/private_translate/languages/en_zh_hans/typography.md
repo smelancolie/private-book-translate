@@ -1,0 +1,1 @@
+Use standard Simplified Chinese punctuation and spacing. Use Chinese quotation marks for Chinese prose, preserve punctuation that belongs to code or protected text, and keep numbers, dates, units, ranges, parentheses, and citations faithful to the source. Do not alter links or structural markers.

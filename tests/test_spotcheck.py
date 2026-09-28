@@ -23,11 +23,18 @@ class SpotcheckTests(unittest.TestCase):
             ("paragraph", "Source two.", "译文二。", True),
             ("table", "Table source.", "表格译文。", True),
             ("caption_note", "Caption source.", "说明译文。", True),
-            ("figure", "Figure source.", "图示译文。", True),
+            ("figure", "A cover.", "A cover.", False),
             ("formula", "x + y", "x + y", False),
         ]):
+            metadata = {}
+            if kind == "figure":
+                metadata = {
+                    "asset_path": "images/cover.png", "asset_hash": "asset-sha256",
+                    "alt": "A cover", "caption_unit_ids": [],
+                    "surrounding_unit_ids": [self.units[0].id], "surrounding_text": [self.units[0].source_text],
+                }
             unit = TranslationUnit.create(section_id="chapter-1", type=kind, source_text=source,
-                translatable=translatable, source_language="en", target_language="zh-Hans", locator={"slot": index})
+                translatable=translatable, source_language="en", target_language="zh-Hans", locator={"slot": index}, metadata=metadata)
             unit.target_text = target
             unit.translation_status = "translated"
             unit.qa_status = "passed"
@@ -71,6 +78,11 @@ class SpotcheckTests(unittest.TestCase):
         sample = read_json(first / "sample.json")
         self.assertEqual(set(sample["strata"]), {"paragraph", "table", "figure", "formula", "caption_note"})
         self.assertEqual(sample["strata"]["formula"]["samples_by_reviewer"]["reviewer_1"], [self.units[-1].id])
+        figure_sample = next(item for item in sample["samples"] if item["type"] == "figure")
+        self.assertEqual(figure_sample["asset_path"], "images/cover.png")
+        self.assertEqual(figure_sample["asset_hash"], "asset-sha256")
+        self.assertEqual(figure_sample["alt"], "A cover")
+        self.assertEqual(figure_sample["surrounding_text"], ["Source one."])
         with self.assertRaisesRegex(ValueError, "review evidence is incomplete"):
             validate_spotcheck(self.root, self.document)
         self.approve_round(first)

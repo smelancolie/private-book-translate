@@ -1,0 +1,1 @@
+Keep recurring concepts, specialist terms, headings, and titles consistent throughout the book. Follow approved glossary entries exactly, including forbidden translations. Preserve technical distinctions and established English terminology when a Chinese equivalent would be misleading.
