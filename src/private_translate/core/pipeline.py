@@ -16,6 +16,7 @@ from .batching import maximum_unit_tokens, split_oversized_units, translation_ba
 from .providers import OpenAICompatibleProvider, TranslationProvider
 from .qa import run_book_consistency, run_chapter_qa, validate_qa
 from .spotcheck import validate_spotcheck
+from .execution import select_translation_backend
 from .state import merge_saved_state, read_json, write_json
 
 
@@ -140,8 +141,17 @@ def _build(project: Path, manifest: dict, document: Document) -> list[Path]:
     return built
 
 
-def run_project(project: Path, *, base_url: str | None = None, model: str | None = None, bilingual: bool = False, provider: TranslationProvider | None = None) -> list[Path]:
+def _write_run_state(project: Path, status: str, **updates) -> None:
+    path = project / "state" / "state.json"
+    state = read_json(path) if path.exists() else {}
+    state.update({"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": status, **updates})
+    write_json(path, state)
+
+
+def run_project(project: Path, *, base_url: str | None = None, model: str | None = None, bilingual: bool = False, provider: TranslationProvider | None = None, translation_backend: int = 2) -> list[Path]:
+    backend = select_translation_backend(translation_backend)
     project, manifest, saved = _load_project(project)
+    _write_run_state(project, "running", requested_backend=translation_backend, actual_backend=1 if backend == "agent" else 2)
     if bilingual:
         manifest["bilingual"] = True
         write_json(project / "project.json", manifest)
@@ -159,7 +169,7 @@ def run_project(project: Path, *, base_url: str | None = None, model: str | None
     run_chapter_qa(project, fresh, active_provider, language, glossary)
     run_book_consistency(project, fresh, active_provider, language, glossary)
     result = _build(project, manifest, fresh)
-    write_json(project / "state" / "state.json", {"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "spotcheck_pending"})
+    _write_run_state(project, "spotcheck_pending")
     return result
 
 
@@ -169,7 +179,7 @@ def build_project(project: Path) -> list[Path]:
         raise ValueError("Project has not been parsed; run translate run first")
     spotcheck = validate_spotcheck(project, document)
     result = _build(project, manifest, document)
-    write_json(project / "state" / "state.json", {"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "complete", "spotcheck_run_id": spotcheck["run_id"]})
+    _write_run_state(project, "complete", spotcheck_run_id=spotcheck["run_id"])
     return result
 
 
@@ -185,5 +195,5 @@ def validate_project(project: Path) -> dict[str, str]:
     if manifest.get("bilingual"):
         adapter.validate(bilingual_path)
     spotcheck = validate_spotcheck(project, document)
-    write_json(project / "state" / "state.json", {"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "complete", "spotcheck_run_id": spotcheck["run_id"]})
+    _write_run_state(project, "complete", spotcheck_run_id=spotcheck["run_id"])
     return {"target_only": str(target_path), "bilingual": str(bilingual_path) if manifest.get("bilingual") else "not requested"}
