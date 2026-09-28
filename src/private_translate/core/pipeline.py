@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import time
+from typing import Protocol
 from urllib.parse import unquote, urlsplit
 
 from private_translate.formats.markdown import MarkdownAdapter
@@ -14,9 +15,26 @@ from .language import load_language_package
 from .model import Document
 from .batching import maximum_unit_tokens, split_oversized_units, translation_batches
 from .providers import OpenAICompatibleProvider, TranslationProvider
-from .qa import run_book_consistency, run_chapter_qa, validate_qa
+from .qa import _target_hash, run_book_consistency, run_chapter_qa, run_chapter_qa_agent, validate_qa
 from .spotcheck import validate_spotcheck
+from .execution import (
+    PatchConflict,
+    apply_translation_patch,
+    create_translation_task,
+    load_translation_task,
+    review_target_digest,
+    select_translation_backend,
+    validate_translation_patch,
+)
 from .state import merge_saved_state, read_json, write_json
+
+
+DEFAULT_AGENT_MODEL = "gpt-6-luna-max"
+DEFAULT_AGENT_REVIEW_MODEL = "gpt-6-luna-max"
+
+
+class AgentExecutor(Protocol):
+    def execute(self, task: dict, *, model: str) -> dict: ...
 
 
 def _load_project(project: Path):
@@ -71,6 +89,53 @@ def _translate(document: Document, project: Path, provider: TranslationProvider,
             write_json(project / "work" / "document.json", document.to_dict())
             raise
         write_json(project / "work" / "document.json", document.to_dict())
+
+
+def _translate_agent(
+    document: Document, project: Path, provider: TranslationProvider,
+    language: dict, glossary: list[dict[str, str]], executor: AgentExecutor,
+    model: str,
+) -> Document:
+    owner_id = "agent:translation-owner"
+    for section, units in _pending_by_section(document):
+        context = json.dumps({"section": section.title}, ensure_ascii=False)
+        for batch, batch_context, _ in translation_batches(units, provider, language, context, glossary):
+            task_path = create_translation_task(
+                project, section.section_id, owner_id,
+                unit_ids=[unit.id for unit in batch], batch_context=json.loads(batch_context),
+            )
+            task = load_translation_task(project, task_path.stem)
+            for attempt in range(2):
+                patch = executor.execute(task, model=model)
+                if not isinstance(patch, dict):
+                    raise ValueError("Agent executor must return a TranslationPatch object")
+                patch.setdefault("model", model)
+                try:
+                    validate_translation_patch(project, patch)
+                    document = apply_translation_patch(project, patch)
+                except PatchConflict:
+                    if attempt == 0:
+                        task_path = create_translation_task(
+                            project, section.section_id, owner_id,
+                            unit_ids=[unit.id for unit in batch], batch_context=json.loads(batch_context),
+                        )
+                        task = load_translation_task(project, task_path.stem)
+                        continue
+                    raise
+                write_json(project / "work" / "patches" / "translation" / f"{task['task_id']}.json", {
+                    "task_id": task["task_id"], "patch_id": patch["patch_id"],
+                    "chapter_id": task["chapter_id"], "owner_id": task["owner_id"],
+                    "requested_backend": 1, "actual_backend": 1,
+                    "model": patch.get("model", model), "patch": patch,
+                    "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "base_chapter_digest": task["base_chapter_digest"],
+                    "target_digest_after_merge": review_target_digest([
+                        {"unit_id": unit.id, "target_text": unit.target_text or ""}
+                        for unit in document.units if unit.section_id == section.section_id and unit.translatable
+                    ]),
+                })
+                break
+    return document
 
 
 def _output_paths(project: Path, manifest: dict) -> tuple[Path, Path]:
@@ -140,8 +205,44 @@ def _build(project: Path, manifest: dict, document: Document) -> list[Path]:
     return built
 
 
-def run_project(project: Path, *, base_url: str | None = None, model: str | None = None, bilingual: bool = False, provider: TranslationProvider | None = None) -> list[Path]:
+def _write_run_state(project: Path, status: str, **updates) -> None:
+    path = project / "state" / "state.json"
+    state = read_json(path) if path.exists() else {}
+    state.update({"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": status, **updates})
+    write_json(path, state)
+
+
+def run_project(
+    project: Path, *, base_url: str | None = None, model: str | None = None,
+    bilingual: bool = False, provider: TranslationProvider | None = None,
+    translation_backend: int = 2, agent_executor: AgentExecutor | None = None,
+    agent_model: str = DEFAULT_AGENT_MODEL, review_backend: int = 2,
+    review_executor: AgentExecutor | None = None, reviewer_id: str = "agent:chapter-reviewer",
+    review_model: str = DEFAULT_AGENT_REVIEW_MODEL, allow_review_fallback: bool = False,
+) -> list[Path]:
+    backend = select_translation_backend(translation_backend)
+    if backend == "agent" and agent_executor is None:
+        raise RuntimeError("AGENT_BACKEND_UNAVAILABLE: provide a host-native AgentExecutor; API fallback is disabled")
+    selected_review_backend = select_translation_backend(review_backend)
+    fallback_reason = None
+    if selected_review_backend == "agent" and review_executor is None:
+        if not allow_review_fallback:
+            raise RuntimeError("AGENT_REVIEW_UNAVAILABLE: API fallback requires explicit allow_review_fallback")
+        selected_review_backend = "api"
+        fallback_reason = "AGENT_REVIEW_UNAVAILABLE"
+    translation_owner_id = "agent:translation-owner" if backend == "agent" else "api:translation-owner"
+    if selected_review_backend == "agent" and reviewer_id == translation_owner_id:
+        raise ValueError("reviewer_id must differ from translation_owner_id")
     project, manifest, saved = _load_project(project)
+    _write_run_state(
+        project, "running", requested_backend=translation_backend,
+        actual_backend=1 if backend == "agent" else 2,
+        requested_review_backend=review_backend,
+        actual_review_backend=1 if selected_review_backend == "agent" else 2,
+        fallback_reason=fallback_reason,
+        translation_owner_id=translation_owner_id,
+        reviewer_id=reviewer_id if selected_review_backend == "agent" else "api:reviewer",
+    )
     if bilingual:
         manifest["bilingual"] = True
         write_json(project / "project.json", manifest)
@@ -155,11 +256,33 @@ def run_project(project: Path, *, base_url: str | None = None, model: str | None
     write_json(project / "work" / "document.json", fresh.to_dict())
     prepare_terminology(project, fresh, active_provider, language)
     glossary = load_glossary(project / "glossary" / "terms.csv")
-    _translate(fresh, project, active_provider, language, glossary)
-    run_chapter_qa(project, fresh, active_provider, language, glossary)
-    run_book_consistency(project, fresh, active_provider, language, glossary)
-    result = _build(project, manifest, fresh)
-    write_json(project / "state" / "state.json", {"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "spotcheck_pending"})
+    if backend == "agent":
+        fresh = _translate_agent(fresh, project, active_provider, language, glossary, agent_executor, agent_model)
+    else:
+        _translate(fresh, project, active_provider, language, glossary)
+    if selected_review_backend == "agent":
+        for _ in range(3):
+            run_book_consistency(project, fresh, active_provider, language, glossary)
+            fresh = run_chapter_qa_agent(
+                project, fresh, active_provider, language, glossary, review_executor,
+                reviewer_id=reviewer_id, translation_owner_id=translation_owner_id,
+                review_model=review_model, translation_backend=1 if backend == "agent" else 2,
+                translation_executor=agent_executor if backend == "agent" else None,
+                translation_model=agent_model,
+            )
+            report = read_json(project / "qa" / "book-consistency.json")
+            if report.get("status") == "PASS" and report.get("target_hash") == _target_hash(
+                [unit for unit in fresh.units if unit.translatable and unit.target_text is not None]
+            ):
+                break
+        else:
+            raise RuntimeError("Agent chapter QA and book consistency did not converge on one target revision")
+        result = _build(project, manifest, fresh)
+    else:
+        run_chapter_qa(project, fresh, active_provider, language, glossary)
+        run_book_consistency(project, fresh, active_provider, language, glossary)
+        result = _build(project, manifest, fresh)
+    _write_run_state(project, "spotcheck_pending")
     return result
 
 
@@ -169,7 +292,7 @@ def build_project(project: Path) -> list[Path]:
         raise ValueError("Project has not been parsed; run translate run first")
     spotcheck = validate_spotcheck(project, document)
     result = _build(project, manifest, document)
-    write_json(project / "state" / "state.json", {"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "complete", "spotcheck_run_id": spotcheck["run_id"]})
+    _write_run_state(project, "complete", spotcheck_run_id=spotcheck["run_id"])
     return result
 
 
@@ -185,5 +308,5 @@ def validate_project(project: Path) -> dict[str, str]:
     if manifest.get("bilingual"):
         adapter.validate(bilingual_path)
     spotcheck = validate_spotcheck(project, document)
-    write_json(project / "state" / "state.json", {"last_run": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "status": "complete", "spotcheck_run_id": spotcheck["run_id"]})
+    _write_run_state(project, "complete", spotcheck_run_id=spotcheck["run_id"])
     return {"target_only": str(target_path), "bilingual": str(bilingual_path) if manifest.get("bilingual") else "not requested"}

@@ -3,8 +3,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import re
+import time
+from typing import Protocol
 
 from .batching import review_batches, translation_batches
+from .execution import (
+    apply_translation_patch,
+    create_review_task,
+    create_translation_task,
+    load_translation_task,
+    review_target_digest,
+    validate_review_evidence_current,
+    validate_translation_patch,
+)
 from .glossary import consistency_issues
 from .model import Document, TranslationUnit, content_hash
 from .providers import TranslationProvider
@@ -12,6 +23,10 @@ from .state import read_json, write_json
 
 
 REVIEWS_PER_INVOCATION = 3
+
+
+class ReviewExecutor(Protocol):
+    def execute(self, task: dict, *, model: str) -> dict: ...
 
 
 def _target_hash(units: list[TranslationUnit]) -> str:
@@ -125,6 +140,167 @@ def run_chapter_qa(project: Path, document: Document, provider: TranslationProvi
                 unit.qa_status = "failed"
             _save_document(project, document)
             raise RuntimeError(f"Chapter {section.section_id} still needs a zero-issue full recheck; resume to continue")
+
+
+def _agent_review_fixes(
+    project: Path, document: Document, chapter_id: str, issues: list[dict],
+    provider: TranslationProvider, language: dict, glossary: list[dict[str, str]],
+    executor: ReviewExecutor, owner_id: str, model: str,
+) -> tuple[Document, int]:
+    issue_ids = {issue["unit_id"] for issue in issues}
+    selected = [unit for unit in document.units if unit.section_id == chapter_id and unit.id in issue_ids]
+    context = json.dumps({"purpose": "fix these independent review findings", "issues": issues}, ensure_ascii=False)
+    applied = 0
+    for batch, batch_context, _ in translation_batches(selected, provider, language, context, glossary):
+        batch_ids = {unit.id for unit in batch}
+        task_path = create_translation_task(
+            project, chapter_id, owner_id,
+            unit_ids=[unit.id for unit in batch],
+            batch_context={"review_issues": [issue for issue in issues if issue["unit_id"] in batch_ids],
+                           "translation_batch": json.loads(batch_context)},
+        )
+        task = load_translation_task(project, task_path.stem)
+        patch = executor.execute(task, model=model)
+        if not isinstance(patch, dict):
+            raise ValueError("Agent executor must return a TranslationPatch object")
+        patch.setdefault("model", model)
+        before = {unit.id: unit.target_text for unit in batch}
+        validate_translation_patch(project, patch)
+        document = apply_translation_patch(project, patch)
+        after = {unit.id: unit.target_text for unit in document.units if unit.id in batch_ids}
+        applied += sum(before[unit_id] != after[unit_id] for unit_id in batch_ids)
+        chapter_targets = [
+            {"unit_id": unit.id, "target_text": unit.target_text or ""}
+            for unit in document.units if unit.section_id == chapter_id and unit.translatable
+        ]
+        write_json(project / "work" / "patches" / "translation" / f"{task['task_id']}.json", {
+            "task_id": task["task_id"], "patch_id": patch["patch_id"],
+            "chapter_id": task["chapter_id"], "owner_id": task["owner_id"],
+            "requested_backend": 1, "actual_backend": 1, "model": patch.get("model", model),
+            "patch": patch, "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "base_chapter_digest": task["base_chapter_digest"],
+            "target_digest_after_merge": review_target_digest(chapter_targets),
+        })
+    return document, applied
+
+
+def run_chapter_qa_agent(
+    project: Path, document: Document, provider: TranslationProvider, language: dict,
+    glossary: list[dict[str, str]], executor: ReviewExecutor, *, reviewer_id: str,
+    translation_owner_id: str, review_model: str, translation_backend: int,
+    translation_executor: ReviewExecutor | None = None, translation_model: str = "gpt-6-luna-max",
+) -> Document:
+    for section in document.sections:
+        translated = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable]
+        if not translated:
+            continue
+        control = project / "qa" / "chapter-controls" / f"{section.section_id}.json"
+        control_record = read_json(control) if control.exists() else {}
+        rounds = control_record.get("rounds", [])
+        target_digest = review_target_digest([
+            {"unit_id": unit.id, "target_text": unit.target_text or ""} for unit in translated
+        ])
+        latest = rounds[-1] if rounds else {}
+        if (
+            all(unit.qa_status == "passed" and unit.target_text is not None and unit.last_qa_target_hash == content_hash(unit.target_text) for unit in translated)
+            and control_record.get("latest_round_status") == "PASS"
+            and latest.get("reviewer_id") == reviewer_id
+            and latest.get("translation_owner_id") == translation_owner_id
+            and latest.get("coverage_status") == "FULL_CHAPTER_COVERAGE"
+            and latest.get("target_digest") == target_digest
+        ):
+            continue
+        for _ in range(REVIEWS_PER_INVOCATION):
+            context = json.dumps({"section_title": section.title}, ensure_ascii=False)
+            batches = review_batches(translated, provider, language, context, language["review_rubric"])
+            expected_ids = [unit.id for unit in translated]
+            batch_ids = [unit.id for batch, _ in batches for unit in batch]
+            if batch_ids != expected_ids:
+                raise ValueError("Agent review batches must cover the complete chapter exactly once")
+            evidence_task_ids = []
+            issues = []
+            for index, (batch, batch_context) in enumerate(batches):
+                source_text = " ".join(unit.source_text.casefold() for unit in batch)
+                task = create_review_task(
+                    document, section.section_id, reviewer_id, translation_owner_id,
+                    language["review_rubric"],
+                    context_capsule={
+                        "section_title": section.title,
+                        "batch_context": json.loads(batch_context),
+                        "glossary_slice": [term for term in glossary if term["source"].casefold() in source_text],
+                        "review_batch": {"index": index, "count": len(batches), "unit_ids": [unit.id for unit in batch]},
+                    },
+                    unit_ids=[unit.id for unit in batch],
+                )
+                task_path = project / "work" / "tasks" / "review" / f"{task['task_id']}.json"
+                write_json(task_path, task)
+                evidence = executor.execute(task, model=review_model)
+                validate_review_evidence_current(project, evidence, task)
+                evidence_path = project / "qa" / "review-evidence" / f"{task['task_id']}.json"
+                write_json(evidence_path, evidence)
+                evidence_task_ids.append(task["task_id"])
+                issues.extend(evidence["issues"])
+
+            full_target_digest = review_target_digest([
+                {"unit_id": unit.id, "target_text": unit.target_text or ""} for unit in translated
+            ])
+            if not issues:
+                target_hashes = {unit.id: content_hash(unit.target_text or "") for unit in translated}
+                record = {
+                    "round": len(rounds) + 1, "scope": "FULL_CHAPTER",
+                    "coverage_status": "FULL_CHAPTER_COVERAGE", "review_batch_count": len(batches),
+                    "evidence_task_ids": evidence_task_ids, "reviewer_id": reviewer_id,
+                    "translation_owner_id": translation_owner_id, "review_model": review_model,
+                    "target_digest": full_target_digest, "issues_found": 0, "fixes_applied": 0,
+                    "unresolved_blocking_issues": 0, "latest_round_status": "PASS", "allow_next_chapter": True,
+                }
+                _append_round(control, rounds, record)
+                for unit in translated:
+                    unit.qa_status = "passed"
+                    unit.last_qa_target_hash = target_hashes[unit.id]
+                    unit.last_error = None
+                _save_document(project, document)
+                break
+
+            record = {
+                "round": len(rounds) + 1, "scope": "FULL_CHAPTER",
+                "coverage_status": "FULL_CHAPTER_COVERAGE", "review_batch_count": len(batches),
+                "evidence_task_ids": evidence_task_ids, "reviewer_id": reviewer_id,
+                "translation_owner_id": translation_owner_id, "review_model": review_model,
+                "target_digest": full_target_digest, "issues_found": len(issues),
+                "fixes_applied": 0, "unresolved_blocking_issues": len(issues),
+                "latest_round_status": "FIXED_RECHECK_REQUIRED", "allow_next_chapter": False,
+                "issues": issues,
+            }
+            _append_round(control, rounds, record)
+            if translation_backend == 1:
+                if translation_executor is None:
+                    raise RuntimeError("AGENT_FIX_BACKEND_UNAVAILABLE: translation owner is unavailable")
+                document, applied = _agent_review_fixes(
+                    project, document, section.section_id, issues, provider, language, glossary,
+                    translation_executor, translation_owner_id, translation_model,
+                )
+            else:
+                issue_ids = {issue["unit_id"] for issue in issues}
+                selected = [unit for unit in translated if unit.id in issue_ids]
+                fixes = _translate_fixes(selected, provider, language, glossary, issues)
+                applied = 0
+                for unit in selected:
+                    applied += fixes[unit.id] != unit.target_text
+                    unit.target_text = fixes[unit.id]
+                    unit.qa_status = "pending"
+                    unit.last_qa_target_hash = None
+                _save_document(project, document)
+            rounds[-1]["fixes_applied"] = applied
+            _append_round(control, rounds[:-1], rounds[-1])
+            document = Document.from_dict(read_json(project / "work" / "document.json"))
+            translated = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable]
+        else:
+            for unit in translated:
+                unit.qa_status = "failed"
+            _save_document(project, document)
+            raise RuntimeError(f"Chapter {section.section_id} still needs a zero-issue full recheck; resume to continue")
+    return document
 
 
 def run_book_consistency(project: Path, document: Document, provider: TranslationProvider, language: dict, glossary: list[dict[str, str]]) -> None:

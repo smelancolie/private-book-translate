@@ -5,10 +5,23 @@ import json
 from pathlib import Path
 import sys
 
-from private_translate.core.pipeline import assert_project_source_current, build_project, run_project, validate_project
+from private_translate.core.pipeline import (
+    DEFAULT_AGENT_MODEL,
+    DEFAULT_AGENT_REVIEW_MODEL,
+    AgentExecutor,
+    assert_project_source_current,
+    build_project,
+    run_project,
+    validate_project,
+)
 from private_translate.core.project import create_project
 from private_translate.core.model import Document
-from private_translate.core.spotcheck import create_spotcheck_round
+from private_translate.core.spotcheck import (
+    DEFAULT_AGENT_SPOTCHECK_MODEL,
+    SpotcheckExecutor,
+    create_spotcheck_round,
+    run_agent_spotcheck_round,
+)
 from private_translate.core.state import read_json
 
 
@@ -28,14 +41,28 @@ def parser() -> argparse.ArgumentParser:
         if name in {"run", "resume"}:
             command.add_argument("--base-url")
             command.add_argument("--model")
+            command.add_argument("--translation-backend", type=int, choices=(1, 2), default=1, help="1=Agent, 2=API (default: 1)")
+            command.add_argument("--agent-model", default=DEFAULT_AGENT_MODEL)
+            command.add_argument("--review-backend", type=int, choices=(1, 2), default=2, help="1=Agent, 2=API (default: 2)")
+            command.add_argument("--review-model", default=DEFAULT_AGENT_REVIEW_MODEL)
+            command.add_argument("--allow-review-fallback", action="store_true", help="allow Agent chapter review to fall back to API when unavailable")
     spotcheck = commands.add_parser("spotcheck", help="generate a stratified review sample for the current run")
     spotcheck.add_argument("project", type=Path)
     spotcheck.add_argument("--seed", type=int)
     spotcheck.add_argument("--new-run", action="store_true", help="start a new current-run review campaign")
+    spotcheck.add_argument("--spotcheck-backend", choices=("template", "agent"), default="template")
+    spotcheck.add_argument("--spotcheck-model", default=DEFAULT_AGENT_SPOTCHECK_MODEL)
+    spotcheck.add_argument("--reviewer-a-id", default="agent:spotcheck-a")
+    spotcheck.add_argument("--reviewer-b-id", default="agent:spotcheck-b")
     return root
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None, *, agent_executor: AgentExecutor | None = None,
+    review_executor: AgentExecutor | None = None,
+    spotcheck_executor_a: SpotcheckExecutor | None = None,
+    spotcheck_executor_b: SpotcheckExecutor | None = None,
+) -> int:
     args = parser().parse_args(argv)
     if args.command == "init":
         project = create_project(args.input_file, args.projects_dir, args.source_language, args.target_language)
@@ -61,10 +88,26 @@ def main(argv: list[str] | None = None) -> int:
             project = args.project.resolve(strict=True)
             assert_project_source_current(project)
             document = Document.from_dict(read_json(project / "work" / "document.json"))
-            print(create_spotcheck_round(project, document, args.seed, new_run=args.new_run))
+            if args.spotcheck_backend == "agent":
+                if spotcheck_executor_a is None or spotcheck_executor_b is None:
+                    raise RuntimeError("AGENT_SPOTCHECK_BACKEND_UNAVAILABLE: provide two independent host executors")
+                result = run_agent_spotcheck_round(
+                    project, document, args.seed, args.reviewer_a_id, args.reviewer_b_id,
+                    spotcheck_executor_a, spotcheck_executor_b,
+                    model=args.spotcheck_model, new_run=args.new_run,
+                )
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                print(create_spotcheck_round(project, document, args.seed, new_run=args.new_run))
             return 0
         if args.command in {"run", "resume"}:
-            outputs = run_project(args.project, base_url=args.base_url, model=args.model, bilingual=args.bilingual)
+            outputs = run_project(
+                args.project, base_url=args.base_url, model=args.model, bilingual=args.bilingual,
+                translation_backend=args.translation_backend, agent_executor=agent_executor,
+                agent_model=args.agent_model, review_backend=args.review_backend,
+                review_executor=review_executor, review_model=args.review_model,
+                allow_review_fallback=args.allow_review_fallback,
+            )
             print("\n".join(str(path) for path in outputs))
         elif args.command == "build":
             print("\n".join(str(path) for path in build_project(args.project)))

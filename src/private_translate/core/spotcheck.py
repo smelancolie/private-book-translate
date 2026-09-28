@@ -5,8 +5,12 @@ import math
 from pathlib import Path
 import random
 import secrets
+import shutil
+import subprocess
+from typing import Protocol
 import uuid
 
+from .language import load_language_package
 from .model import Document, TranslationUnit, content_hash
 from .qa import validate_qa
 from .state import read_json, write_json
@@ -16,6 +20,39 @@ STRATA = ("paragraph", "table", "figure", "formula", "caption_note")
 TARGET_CONFIDENCE = 0.80
 DEFECT_RATE = 0.10
 REVIEWERS = ("reviewer_1", "reviewer_2")
+DEFAULT_AGENT_SPOTCHECK_MODEL = "gpt-6-luna-max"
+QUALITY_FAMILY_CATEGORIES = {
+    "proper_name", "polysemy", "terminology", "source_syntax",
+    "mechanical_literalism", "dialogue_stiffness",
+}
+FINDING_CATEGORIES = QUALITY_FAMILY_CATEGORIES | {
+    "fidelity", "omission", "addition", "style", "other",
+}
+SPOTCHECK_EVIDENCE_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "required": ["schema_version", "task_id", "round_id", "reviewer_id", "scores", "findings", "style_debt_count"],
+    "properties": {
+        "schema_version": {"const": 1}, "task_id": {"type": "string"},
+        "round_id": {"type": "string"}, "reviewer_id": {"type": "string"},
+        "scores": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0, "maximum": 100}},
+        "style_debt_count": {"type": "integer", "minimum": 0},
+        "findings": {"type": "array", "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["unit_id", "family_id", "category", "description", "reusable_rule"],
+            "properties": {
+                "unit_id": {"type": "string"}, "family_id": {"type": "string"},
+                "category": {"enum": sorted(FINDING_CATEGORIES)},
+                "description": {"type": "string"}, "reusable_rule": {"type": "string"},
+            },
+        }},
+    },
+}
+
+
+class SpotcheckExecutor(Protocol):
+    worker_id: str
+
+    def execute(self, task: dict, *, model: str) -> dict: ...
 
 
 def _stratum(unit: TranslationUnit) -> str | None:
@@ -134,6 +171,13 @@ def _family_closure(directory: Path, family_ids: set[str], document: Document, s
         raise ValueError(f"Defect family closure is missing for {directory.name}")
     closure = read_json(path)
     sample = read_json(directory / "sample.json")
+    _validate_family_closure_record(closure, sample, family_ids, document, sample_by_id)
+
+
+def _validate_family_closure_record(
+    closure: dict, sample: dict, family_ids: set[str], document: Document,
+    sample_by_id: dict[str, dict],
+) -> None:
     if closure.get("run_id") != sample.get("run_id") or closure.get("round") != sample.get("round"):
         raise ValueError("Defect closure evidence does not match its spot-check run and round")
     if closure.get("families") is None:
@@ -178,8 +222,8 @@ def _family_closure(directory: Path, family_ids: set[str], document: Document, s
                     raise ValueError(f"Defect family {family_id!r} baseline does not match the sampled target for unit {unit_id}")
             elif result == "exception" and not exceptions.get(unit_id, "").strip():
                 raise ValueError(f"Defect family {family_id!r} needs a reason for exception {unit_id}")
-        if any(results[unit_id] == "clear" for unit_id in issue_units):
-            raise ValueError(f"Defect family {family_id!r} cannot mark a reported sample defect clear")
+        if any(results[unit_id] != "fixed" for unit_id in issue_units):
+            raise ValueError(f"Defect family {family_id!r} must fix every reported sample defect")
         if family.get("closure_status") != "CLOSED":
             raise ValueError(f"Defect family {family_id!r} is not closed")
 
@@ -297,20 +341,340 @@ def create_spotcheck_round(project: Path, document: Document, seed: int | None =
     number = len(rounds) + 1
     directory = run_dir / f"round-{number:04d}"
     directory.mkdir(parents=True)
+    round_id = str(uuid.uuid4())
     write_json(directory / "sample.json", {
-        "run_id": active["run_id"], "round": number, "seed": selected_seed,
+        "run_id": active["run_id"], "round_id": round_id, "round": number, "seed": selected_seed,
         "target_confidence": TARGET_CONFIDENCE, "defect_rate_threshold": DEFECT_RATE,
         "strata": strata_record, "reviewer_unit_ids": reviewer_unit_ids, "samples": sample_items,
     })
     write_json(directory / "review-template.json", {
-        "run_id": active["run_id"], "round": number, "seed": selected_seed,
+        "run_id": active["run_id"], "round_id": round_id, "round": number, "seed": selected_seed,
         "reviewers": [
             {"slot": reviewer, "reviewer_id": "", "scores": {unit_id: None for unit_id in reviewer_unit_ids[reviewer]}, "style_debt_count": None, "findings": None}
             for reviewer in REVIEWERS
         ],
     })
-    write_json(directory / "closure-template.json", {"run_id": active["run_id"], "round": number, "families": []})
+    write_json(directory / "closure-template.json", {"run_id": active["run_id"], "round_id": round_id, "round": number, "families": []})
     return directory
+
+
+def _defect_knowledge_path(project: Path) -> Path:
+    return project.resolve(strict=True).parent / ".knowledge" / "en_zh_hans" / "defect_families.md"
+
+
+def _require_current_document(project: Path, document: Document) -> None:
+    path = project / "work" / "document.json"
+    if not path.is_file() or Document.from_dict(read_json(path)).to_dict() != document.to_dict():
+        raise ValueError("Spot-check document is stale; reload the canonical document before continuing")
+
+
+def _require_git_ignored(project: Path, path: Path) -> None:
+    if not shutil.which("git"):
+        return
+    root = subprocess.run(
+        ["git", "-C", str(project), "rev-parse", "--show-toplevel"],
+        capture_output=True, text=True,
+    )
+    if root.returncode:
+        return
+    relative = path.relative_to(Path(root.stdout.strip()))
+    ignored = subprocess.run(
+        ["git", "-C", root.stdout.strip(), "check-ignore", "--quiet", "--no-index", "--", relative.as_posix()]
+    )
+    if ignored.returncode == 1:
+        raise ValueError(f"Private defect-family knowledge is not ignored by Git: {path}")
+    ignored.check_returncode()
+
+
+def _quality_rules(project: Path) -> list[str]:
+    path = _defect_knowledge_path(project)
+    if not path.exists():
+        return []
+    return [line for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("- ")]
+
+
+def create_spotcheck_tasks(
+    project: Path, document: Document, directory: Path, reviewer_a_id: str,
+    reviewer_b_id: str, *, model: str = DEFAULT_AGENT_SPOTCHECK_MODEL,
+) -> dict[str, dict]:
+    if not reviewer_a_id.strip() or not reviewer_b_id.strip() or reviewer_a_id.casefold() == reviewer_b_id.casefold():
+        raise ValueError("reviewer_a_id and reviewer_b_id must identify two distinct reviewers")
+    sample = read_json(directory / "sample.json")
+    _require_current_document(project, document)
+    _validate_sample(sample, document, set())
+    language = load_language_package(document.source_language, document.target_language)
+    reviewer_ids = {REVIEWERS[0]: reviewer_a_id, REVIEWERS[1]: reviewer_b_id}
+    tasks = {}
+    for slot, reviewer_id in reviewer_ids.items():
+        assigned_ids = sample["reviewer_unit_ids"][slot]
+        assigned_id_set = set(assigned_ids)
+        assigned_samples = [item for item in sample["samples"] if item["unit_id"] in assigned_id_set]
+        task = {
+            "schema_version": 1, "task_type": "spotcheck", "task_id": str(uuid.uuid4()),
+            "run_id": sample["run_id"], "round_id": sample["round_id"],
+            "round": sample["round"], "seed": sample["seed"], "reviewer_id": reviewer_id,
+            "reviewer_slot": slot, "requested_backend": 1, "actual_backend": 1, "model": model,
+            "assigned_samples": assigned_samples,
+            "source_hashes": {item["unit_id"]: item["source_hash"] for item in assigned_samples},
+            "target_hashes": {item["unit_id"]: item["target_hash"] for item in assigned_samples},
+            "rubric": language["review_rubric"] + (
+                "\n\nScore every assigned target from 0 to 100. Report style_debt_count and concrete findings. "
+                "Each finding must name a reusable family and category; quality categories require a general reusable_rule. "
+                "Do not edit targets or any project state. Return only SpotcheckEvidence."
+            ),
+            "quality_rules": _quality_rules(project),
+            "score_schema": {
+                "score_min": 0, "score_max": 100, "average_min_for_pass": 92,
+                "lowest_min_for_pass": 88, "style_debt_count_for_pass": 0,
+                "finding_categories": sorted(FINDING_CATEGORIES),
+            },
+            "required_evidence_schema": SPOTCHECK_EVIDENCE_SCHEMA,
+        }
+        tasks[slot] = task
+    return tasks
+
+
+def _validate_spotcheck_task(task: dict, sample: dict, document: Document) -> None:
+    expected = set(sample["reviewer_unit_ids"].get(task.get("reviewer_slot"), []))
+    assigned = task.get("assigned_samples")
+    if (
+        task.get("schema_version") != 1 or task.get("task_type") != "spotcheck"
+        or not isinstance(task.get("task_id"), str) or not task["task_id"].strip()
+        or task.get("run_id") != sample["run_id"] or task.get("round_id") != sample["round_id"]
+        or task.get("round") != sample["round"] or task.get("seed") != sample["seed"]
+        or task.get("reviewer_slot") not in REVIEWERS or not task.get("reviewer_id")
+        or not isinstance(assigned, list) or {item.get("unit_id") for item in assigned} != expected
+        or len(assigned) != len(expected) or not expected
+    ):
+        raise ValueError("SpotcheckTask identity or assigned sample set is invalid")
+    sample_by_id = {item["unit_id"]: item for item in sample["samples"]}
+    if any(item != sample_by_id.get(item.get("unit_id")) for item in assigned):
+        raise ValueError("SpotcheckTask sample mapping does not match the canonical sample")
+    if task.get("source_hashes") != {item["unit_id"]: item["source_hash"] for item in assigned}:
+        raise ValueError("SpotcheckTask source hashes do not match assigned samples")
+    if task.get("target_hashes") != {item["unit_id"]: item["target_hash"] for item in assigned}:
+        raise ValueError("SpotcheckTask target hashes do not match assigned samples")
+    if (
+        not isinstance(task.get("rubric"), str) or not isinstance(task.get("quality_rules"), list)
+        or task.get("required_evidence_schema") != SPOTCHECK_EVIDENCE_SCHEMA
+    ):
+        raise ValueError("SpotcheckTask rubric or quality rules are invalid")
+    if task.get("score_schema", {}).get("score_min") != 0 or task["score_schema"].get("score_max") != 100:
+        raise ValueError("SpotcheckTask score schema is invalid")
+    _validate_sample(sample, document, set())
+
+
+def validate_spotcheck_evidence(task: dict, evidence: dict) -> None:
+    if not isinstance(evidence, dict) or set(evidence) != {
+        "schema_version", "task_id", "round_id", "reviewer_id", "scores", "findings", "style_debt_count",
+    }:
+        raise ValueError("SpotcheckEvidence schema is invalid")
+    for key in ("task_id", "round_id", "reviewer_id"):
+        if evidence.get(key) != task[key]:
+            raise ValueError(f"SpotcheckEvidence {key} does not match its task")
+    if type(evidence["schema_version"]) is not int or evidence["schema_version"] != 1:
+        raise ValueError("Unsupported SpotcheckEvidence schema")
+    expected_ids = {item["unit_id"] for item in task["assigned_samples"]}
+    scores = evidence["scores"]
+    if not isinstance(scores, dict) or set(scores) != expected_ids:
+        raise ValueError("SpotcheckEvidence must score every assigned sample exactly once")
+    if any(not isinstance(score, (int, float)) or isinstance(score, bool) or not math.isfinite(score) or not 0 <= score <= 100 for score in scores.values()):
+        raise ValueError("SpotcheckEvidence scores must be finite numbers from 0 through 100")
+    debt = evidence["style_debt_count"]
+    if not isinstance(debt, int) or isinstance(debt, bool) or debt < 0:
+        raise ValueError("SpotcheckEvidence style_debt_count must be a non-negative integer")
+    if not isinstance(evidence["findings"], list):
+        raise ValueError("SpotcheckEvidence findings must be an array")
+    required = {"unit_id", "family_id", "category", "description", "reusable_rule"}
+    for finding in evidence["findings"]:
+        if (
+            not isinstance(finding, dict) or set(finding) != required
+            or finding.get("unit_id") not in expected_ids
+            or not isinstance(finding.get("family_id"), str) or not finding["family_id"].strip()
+            or not isinstance(finding.get("category"), str) or finding["category"] not in FINDING_CATEGORIES
+            or not isinstance(finding.get("description"), str) or not finding["description"].strip()
+            or not isinstance(finding.get("reusable_rule"), str)
+        ):
+            raise ValueError("SpotcheckEvidence finding is invalid or outside its assigned samples")
+        if finding["category"] in QUALITY_FAMILY_CATEGORIES and not finding["reusable_rule"].strip():
+            raise ValueError("Quality defect findings need a reusable_rule for family closure")
+
+
+def validate_spotcheck_evidence_current(
+    project: Path, document: Document, directory: Path, task: dict, evidence: dict,
+) -> None:
+    _require_current_document(project, document)
+    sample = read_json(directory / "sample.json")
+    _validate_spotcheck_task(task, sample, document)
+    validate_spotcheck_evidence(task, evidence)
+
+
+def accept_spotcheck_evidence_pair(
+    project: Path, document: Document, directory: Path, tasks: dict[str, dict],
+    evidence_by_slot: dict[str, dict],
+) -> None:
+    if set(tasks) != set(REVIEWERS) or set(evidence_by_slot) != set(REVIEWERS):
+        raise ValueError("Spotcheck acceptance requires both independent reviewer tasks and evidence")
+    if tasks[REVIEWERS[0]]["reviewer_id"].casefold() == tasks[REVIEWERS[1]]["reviewer_id"].casefold():
+        raise ValueError("reviewer_a_id and reviewer_b_id must be distinct")
+    for slot in REVIEWERS:
+        validate_spotcheck_evidence_current(project, document, directory, tasks[slot], evidence_by_slot[slot])
+    tasks_dir = directory / "tasks"
+    evidence_dir = directory / "evidence"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    for slot in REVIEWERS:
+        write_json(tasks_dir / f"{slot}.json", tasks[slot])
+        write_json(evidence_dir / f"{slot}.json", evidence_by_slot[slot])
+
+
+def _family_requirements(reviewers: list[dict]) -> dict[str, dict]:
+    families = {}
+    for reviewer in reviewers:
+        for finding in reviewer["findings"]:
+            entry = families.setdefault(finding["family_id"], {
+                "category": finding["category"], "description": set(),
+                "reported_issue_unit_ids": set(), "reusable_rules": set(),
+            })
+            if entry["category"] != finding["category"]:
+                raise ValueError(f"Defect family {finding['family_id']!r} has inconsistent categories")
+            entry["description"].add(finding["description"])
+            entry["reported_issue_unit_ids"].add(finding["unit_id"])
+            if finding["reusable_rule"].strip():
+                entry["reusable_rules"].add(finding["reusable_rule"])
+    return {
+        family_id: {
+            "family_id": family_id, "category": value["category"],
+            "description": " ".join(sorted(value["description"])),
+            "reusable_rule": sorted(value["reusable_rules"])[0] if value["reusable_rules"] else "",
+            "proposed_reusable_rules": sorted(value["reusable_rules"]), "scope_strata": list(STRATA),
+            "reported_issue_unit_ids": sorted(value["reported_issue_unit_ids"]),
+            "audit_method": "", "audit_results": {}, "fixes": {}, "exceptions": {},
+            "closure_status": "OPEN",
+        }
+        for family_id, value in families.items()
+    }
+
+
+def finalize_spotcheck_round(project: Path, document: Document, directory: Path) -> dict:
+    _require_current_document(project, document)
+    sample = read_json(directory / "sample.json")
+    reviewers = []
+    for slot in REVIEWERS:
+        task = read_json(directory / "tasks" / f"{slot}.json")
+        evidence = read_json(directory / "evidence" / f"{slot}.json")
+        validate_spotcheck_evidence_current(project, document, directory, task, evidence)
+        reviewers.append({
+            "slot": slot, "reviewer_id": task["reviewer_id"], "scores": evidence["scores"],
+            "style_debt_count": evidence["style_debt_count"], "findings": evidence["findings"],
+        })
+    review_record = {
+        "run_id": sample["run_id"], "round_id": sample["round_id"],
+        "round": sample["round"], "seed": sample["seed"], "reviewers": reviewers,
+        "evidence_task_ids": [read_json(directory / "tasks" / f"{slot}.json")["task_id"] for slot in REVIEWERS],
+    }
+    write_json(directory / "reviews.json", review_record)
+    families = _family_requirements(reviewers)
+    if families:
+        write_json(directory / "closure-required.json", {
+            "run_id": sample["run_id"], "round_id": sample["round_id"],
+            "round": sample["round"], "families": list(families.values()),
+        })
+        return {"round": sample["round"], "seed": sample["seed"], "round_status": "DEFECT_FOUND", "issue_families": sorted(families)}
+    root = project / "qa" / "spotcheck"
+    active = read_json(root / "active.json")
+    return _evaluate_round(directory, active["run_id"], sample["round"], document)
+
+
+def run_agent_spotcheck_round(
+    project: Path, document: Document, seed: int | None, reviewer_a_id: str, reviewer_b_id: str,
+    executor_a: SpotcheckExecutor, executor_b: SpotcheckExecutor,
+    *, model: str = DEFAULT_AGENT_SPOTCHECK_MODEL, new_run: bool = False,
+) -> dict:
+    if reviewer_a_id.casefold() == reviewer_b_id.casefold():
+        raise ValueError("reviewer_a_id and reviewer_b_id must be distinct")
+    if executor_a is executor_b:
+        raise ValueError("Spotcheck reviewers must use two independent executor instances")
+    worker_a = getattr(executor_a, "worker_id", None)
+    worker_b = getattr(executor_b, "worker_id", None)
+    if (
+        not isinstance(worker_a, str) or not worker_a.strip()
+        or not isinstance(worker_b, str) or not worker_b.strip()
+        or worker_a.casefold() == worker_b.casefold()
+    ):
+        raise ValueError("Spotcheck reviewers must use two independent workers")
+    _require_current_document(project, document)
+    directory = create_spotcheck_round(project, document, seed, new_run=new_run)
+    completed = False
+    try:
+        tasks = create_spotcheck_tasks(project, document, directory, reviewer_a_id, reviewer_b_id, model=model)
+        evidence_by_slot = {}
+        for slot, executor in zip(REVIEWERS, (executor_a, executor_b), strict=True):
+            task = tasks[slot]
+            evidence = executor.execute(task, model=model)
+            validate_spotcheck_evidence_current(project, document, directory, task, evidence)
+            evidence_by_slot[slot] = evidence
+        accept_spotcheck_evidence_pair(project, document, directory, tasks, evidence_by_slot)
+        result = finalize_spotcheck_round(project, document, directory)
+        completed = True
+        return result
+    finally:
+        if not completed:
+            shutil.rmtree(directory)
+
+
+def close_spotcheck_defect_families(
+    project: Path, document: Document, directory: Path, closure: dict,
+) -> dict:
+    _require_current_document(project, document)
+    sample = read_json(directory / "sample.json")
+    required_path = directory / "closure-required.json"
+    if not required_path.exists():
+        raise ValueError("No Agent spot-check defect family is waiting for closure")
+    required = read_json(required_path)
+    if closure.get("run_id") != sample["run_id"] or closure.get("round_id") != sample["round_id"] or closure.get("round") != sample["round"]:
+        raise ValueError("Defect closure does not match its spot-check round")
+    expected = {family["family_id"]: family for family in required["families"]}
+    observed = {family.get("family_id"): family for family in closure.get("families", [])}
+    if set(observed) != set(expected) or len(observed) != len(closure.get("families", [])):
+        raise ValueError("Defect closure must cover every reported family exactly once")
+    for family_id, value in expected.items():
+        family = observed[family_id]
+        if family.get("category") != value["category"]:
+            raise ValueError(f"Defect family {family_id!r} category changed")
+        if family["category"] in QUALITY_FAMILY_CATEGORIES and not family.get("reusable_rule", "").strip():
+            raise ValueError(f"Defect family {family_id!r} requires a reusable quality rule")
+        if family.get("scope_strata") != list(STRATA):
+            raise ValueError(f"Defect family {family_id!r} must audit every spot-check stratum across the book")
+        if set(family.get("reported_issue_unit_ids", [])) != set(value["reported_issue_unit_ids"]):
+            raise ValueError(f"Defect family {family_id!r} reported issues do not match reviewer evidence")
+    sample_by_id = {item["unit_id"]: item for item in sample["samples"]}
+    _validate_family_closure_record(closure, sample, set(expected), document, sample_by_id)
+    knowledge_path = _defect_knowledge_path(project)
+    if any(value["category"] in QUALITY_FAMILY_CATEGORIES for value in expected.values()):
+        _require_git_ignored(project, knowledge_path)
+    closure_path = directory / "closure.json"
+    write_json(closure_path, closure)
+    try:
+        result = _evaluate_round(directory, sample["run_id"], sample["round"], document)
+    except BaseException:
+        closure_path.unlink(missing_ok=True)
+        raise
+    if result["status"] != "DEFECT_FOUND":
+        closure_path.unlink(missing_ok=True)
+        raise ValueError("Closed defect family did not validate as a defect round")
+    additions = []
+    for family in closure["families"]:
+        if family["category"] in QUALITY_FAMILY_CATEGORIES:
+            additions.append(f"- **{family['category']}**: {' '.join(family['reusable_rule'].split())}")
+    if additions:
+        knowledge_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = knowledge_path.read_text(encoding="utf-8").splitlines() if knowledge_path.exists() else ["# Validated en → zh-Hans spot-check defect rules", ""]
+        for line in additions:
+            if line not in existing:
+                existing.append(line)
+        knowledge_path.write_text("\n".join(existing).rstrip() + "\n", encoding="utf-8")
+    return {"closed_families": sorted(expected), "round_status": result["status"], "quality_rules_added": len(additions)}
 
 
 def validate_spotcheck(project: Path, document: Document) -> dict:

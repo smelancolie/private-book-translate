@@ -93,7 +93,7 @@ def _encode_inlines(inlines: list[dict[str, Any]]) -> tuple[str, list[dict[str, 
                 children = _get_at(template["c"], child_path)
                 _set_inline_children(template, child_path, [])
                 marks.append({"id": ident, "kind": "wrap", "node": template, "child_path": child_path})
-                result.append(f"⟦P{ident}⟧{encode(children, node_path + ["c"] + child_path)}⟦/P{ident}⟧")
+                result.append(f"⟦P{ident}⟧{encode(children, node_path + ['c'] + child_path)}⟦/P{ident}⟧")
         return "".join(result)
 
     return encode(inlines, []), marks
