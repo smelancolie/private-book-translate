@@ -116,6 +116,9 @@ _QUALITY_RULES = [
     "natural dialogue, narrative voice, register, rhythm, imagery, and narrative distance within source evidence",
     "reconstruct Chinese syntax and information order without changing facts or logic",
     "use Chinese typography while preserving citations, numbers, dates, links, code, and protected markers",
+    "for high-risk passages, privately compare candidate A/B/C and synthesize D; return only D in target_text",
+    "resolve polysemy from context and record unresolved future-check items only in patch worker_metadata, never in reader-facing text",
+    "preserve each locked proper-noun placeholder exactly; Python renders it using this task's occurrence contract",
 ]
 
 
@@ -127,7 +130,7 @@ def select_translation_backend(value: int) -> str:
     if type(value) is not int:
         raise ValueError("translation_backend must be 1 (Agent) or 2 (API)")
     if value == 1:
-        raise NotImplementedError("AGENT_BACKEND_NOT_IMPLEMENTED")
+        return "agent"
     if value == 2:
         return "api"
     raise ValueError("translation_backend must be 1 (Agent) or 2 (API)")
@@ -243,6 +246,7 @@ def validate_translation_task(task: dict) -> None:
     by_id = {unit["id"]: unit for unit in task["units"]}
     required = task["required_unit_ids"]
     _require(len(required) == len(set(required)) and set(required) <= set(ids), "TranslationTask required_unit_ids are invalid")
+    _require(required == [unit["id"] for unit in task["units"] if unit["translatable"]], "TranslationTask required_unit_ids do not match its translatable units")
     for unit in task["units"]:
         _require(set(unit) <= {"id", "chapter_id", "source_hash", "structure_hash", "source_text", "type", "translatable", "protected_tokens", "source_parent_id", "ordinal", "metadata"}, "TranslationTask unit contains unknown fields")
         _require(unit.get("chapter_id") == task["chapter_id"], "TranslationTask contains a unit from another chapter")
@@ -279,14 +283,27 @@ def create_translation_task(
     proper_noun_slice: list[dict] | None = None,
     proper_noun_occurrences: list[dict] | None = None,
     polysemy_watchlist: list[dict] | None = None,
+    unit_ids: list[str] | None = None,
+    batch_context: dict | None = None,
 ) -> Path:
     manifest, document = _project_document(project)
     _require(_is_id(owner_id), "owner_id is required")
+    _require(batch_context is None or isinstance(batch_context, dict), "batch_context must be an object")
     section = next((item for item in document.sections if item.section_id == chapter_id), None)
-    units = [unit for unit in document.units if unit.section_id == chapter_id]
-    _require(section is not None and units, f"Unknown or empty chapter {chapter_id!r}")
+    chapter_units = [unit for unit in document.units if unit.section_id == chapter_id]
+    _require(section is not None and chapter_units, f"Unknown or empty chapter {chapter_id!r}")
+    if unit_ids is None:
+        units = chapter_units
+    else:
+        _require(isinstance(unit_ids, list) and len(unit_ids) == len(set(unit_ids)), "Translation task unit_ids must be a unique list")
+        selected_ids = set(unit_ids)
+        _require(selected_ids and selected_ids <= {unit.id for unit in chapter_units}, "Translation task unit_ids must belong to the chapter")
+        units = [unit for unit in chapter_units if unit.id in selected_ids]
     language = load_language_package(manifest["source_language"], manifest["target_language"])
     ids = [unit.id for unit in units]
+    selected_ids = set(ids)
+    occurrences = [item for item in proper_noun_occurrences or [] if item["unit_id"] in selected_ids]
+    entity_ids = {item["entity_id"] for item in occurrences}
     section_index = next(index for index, item in enumerate(document.sections) if item.section_id == chapter_id)
     previous_section = document.sections[section_index - 1] if section_index else None
     next_section = document.sections[section_index + 1] if section_index + 1 < len(document.sections) else None
@@ -311,13 +328,14 @@ def create_translation_task(
             "section_title": section.title,
             "previous_chapter": {"title": previous_section.title, "source": previous_unit.source_text[-120:]} if previous_section and previous_unit else None,
             "next_chapter": {"title": next_section.title, "source": next_unit.source_text[:120]} if next_section and next_unit else None,
+            "batch": batch_context,
         },
         "glossary_slice": [
             term for term in load_glossary(project / "glossary" / "terms.csv")
             if term["source"].casefold() in chapter_source
         ],
-        "proper_noun_slice": proper_noun_slice or [],
-        "proper_noun_occurrences": proper_noun_occurrences or [],
+        "proper_noun_slice": [item for item in proper_noun_slice or [] if item["entity_id"] in entity_ids],
+        "proper_noun_occurrences": occurrences,
         "style_rules": [language["language_rules"][key] for key in ("translation", "terminology", "proper_names", "style", "typography", "polysemy")],
         "translation_quality_rules": list(_QUALITY_RULES),
         "polysemy_watchlist": polysemy_watchlist or [],
@@ -425,6 +443,10 @@ def apply_translation_patch(project: Path, patch: dict) -> Document:
     document = Document.from_dict(read_json(document_path))
     task = _validate_patch_against_document(project, patch, document)
     translations = {item["unit_id"]: item["target_text"] for item in patch["translations"]}
+    for occurrence in sorted(task["proper_noun_occurrences"], key=lambda item: item["occurrence_index"]):
+        placeholder = occurrence.get("placeholder")
+        if placeholder:
+            translations[occurrence["unit_id"]] = translations[occurrence["unit_id"]].replace(placeholder, occurrence["rendering"], 1)
     by_id = {unit.id: unit for unit in document.units if unit.section_id == task["chapter_id"]}
     updated = {
         unit_id for unit_id, text in translations.items()

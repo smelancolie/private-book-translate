@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import time
+from typing import Protocol
 from urllib.parse import unquote, urlsplit
 
 from private_translate.formats.markdown import MarkdownAdapter
@@ -16,8 +17,23 @@ from .batching import maximum_unit_tokens, split_oversized_units, translation_ba
 from .providers import OpenAICompatibleProvider, TranslationProvider
 from .qa import run_book_consistency, run_chapter_qa, validate_qa
 from .spotcheck import validate_spotcheck
-from .execution import select_translation_backend
+from .execution import (
+    PatchConflict,
+    apply_translation_patch,
+    create_translation_task,
+    load_translation_task,
+    review_target_digest,
+    select_translation_backend,
+    validate_translation_patch,
+)
 from .state import merge_saved_state, read_json, write_json
+
+
+DEFAULT_AGENT_MODEL = "gpt-6-luna-max"
+
+
+class AgentExecutor(Protocol):
+    def execute(self, task: dict, *, model: str) -> dict: ...
 
 
 def _load_project(project: Path):
@@ -72,6 +88,53 @@ def _translate(document: Document, project: Path, provider: TranslationProvider,
             write_json(project / "work" / "document.json", document.to_dict())
             raise
         write_json(project / "work" / "document.json", document.to_dict())
+
+
+def _translate_agent(
+    document: Document, project: Path, provider: TranslationProvider,
+    language: dict, glossary: list[dict[str, str]], executor: AgentExecutor,
+    model: str,
+) -> Document:
+    owner_id = "agent:translation-owner"
+    for section, units in _pending_by_section(document):
+        context = json.dumps({"section": section.title}, ensure_ascii=False)
+        for batch, batch_context, _ in translation_batches(units, provider, language, context, glossary):
+            task_path = create_translation_task(
+                project, section.section_id, owner_id,
+                unit_ids=[unit.id for unit in batch], batch_context=json.loads(batch_context),
+            )
+            task = load_translation_task(project, task_path.stem)
+            for attempt in range(2):
+                patch = executor.execute(task, model=model)
+                if not isinstance(patch, dict):
+                    raise ValueError("Agent executor must return a TranslationPatch object")
+                patch.setdefault("model", model)
+                try:
+                    validate_translation_patch(project, patch)
+                    document = apply_translation_patch(project, patch)
+                except PatchConflict:
+                    if attempt == 0:
+                        task_path = create_translation_task(
+                            project, section.section_id, owner_id,
+                            unit_ids=[unit.id for unit in batch], batch_context=json.loads(batch_context),
+                        )
+                        task = load_translation_task(project, task_path.stem)
+                        continue
+                    raise
+                write_json(project / "work" / "patches" / "translation" / f"{task['task_id']}.json", {
+                    "task_id": task["task_id"], "patch_id": patch["patch_id"],
+                    "chapter_id": task["chapter_id"], "owner_id": task["owner_id"],
+                    "requested_backend": 1, "actual_backend": 1,
+                    "model": patch.get("model", model), "patch": patch,
+                    "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "base_chapter_digest": task["base_chapter_digest"],
+                    "target_digest_after_merge": review_target_digest([
+                        {"unit_id": unit.id, "target_text": unit.target_text or ""}
+                        for unit in document.units if unit.section_id == section.section_id and unit.translatable
+                    ]),
+                })
+                break
+    return document
 
 
 def _output_paths(project: Path, manifest: dict) -> tuple[Path, Path]:
@@ -148,8 +211,15 @@ def _write_run_state(project: Path, status: str, **updates) -> None:
     write_json(path, state)
 
 
-def run_project(project: Path, *, base_url: str | None = None, model: str | None = None, bilingual: bool = False, provider: TranslationProvider | None = None, translation_backend: int = 2) -> list[Path]:
+def run_project(
+    project: Path, *, base_url: str | None = None, model: str | None = None,
+    bilingual: bool = False, provider: TranslationProvider | None = None,
+    translation_backend: int = 2, agent_executor: AgentExecutor | None = None,
+    agent_model: str = DEFAULT_AGENT_MODEL,
+) -> list[Path]:
     backend = select_translation_backend(translation_backend)
+    if backend == "agent" and agent_executor is None:
+        raise RuntimeError("AGENT_BACKEND_UNAVAILABLE: provide a host-native AgentExecutor; API fallback is disabled")
     project, manifest, saved = _load_project(project)
     _write_run_state(project, "running", requested_backend=translation_backend, actual_backend=1 if backend == "agent" else 2)
     if bilingual:
@@ -165,7 +235,10 @@ def run_project(project: Path, *, base_url: str | None = None, model: str | None
     write_json(project / "work" / "document.json", fresh.to_dict())
     prepare_terminology(project, fresh, active_provider, language)
     glossary = load_glossary(project / "glossary" / "terms.csv")
-    _translate(fresh, project, active_provider, language, glossary)
+    if backend == "agent":
+        fresh = _translate_agent(fresh, project, active_provider, language, glossary, agent_executor, agent_model)
+    else:
+        _translate(fresh, project, active_provider, language, glossary)
     run_chapter_qa(project, fresh, active_provider, language, glossary)
     run_book_consistency(project, fresh, active_provider, language, glossary)
     result = _build(project, manifest, fresh)

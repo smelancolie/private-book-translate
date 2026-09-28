@@ -5,7 +5,14 @@ import json
 from pathlib import Path
 import sys
 
-from private_translate.core.pipeline import assert_project_source_current, build_project, run_project, validate_project
+from private_translate.core.pipeline import (
+    DEFAULT_AGENT_MODEL,
+    AgentExecutor,
+    assert_project_source_current,
+    build_project,
+    run_project,
+    validate_project,
+)
 from private_translate.core.project import create_project
 from private_translate.core.model import Document
 from private_translate.core.spotcheck import create_spotcheck_round
@@ -28,7 +35,8 @@ def parser() -> argparse.ArgumentParser:
         if name in {"run", "resume"}:
             command.add_argument("--base-url")
             command.add_argument("--model")
-            command.add_argument("--translation-backend", type=int, choices=(1, 2), default=1, help="1=Agent (not implemented yet), 2=API (default: 1)")
+            command.add_argument("--translation-backend", type=int, choices=(1, 2), default=1, help="1=Agent, 2=API (default: 1)")
+            command.add_argument("--agent-model", default=DEFAULT_AGENT_MODEL)
     spotcheck = commands.add_parser("spotcheck", help="generate a stratified review sample for the current run")
     spotcheck.add_argument("project", type=Path)
     spotcheck.add_argument("--seed", type=int)
@@ -36,7 +44,7 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, agent_executor: AgentExecutor | None = None) -> int:
     args = parser().parse_args(argv)
     if args.command == "init":
         project = create_project(args.input_file, args.projects_dir, args.source_language, args.target_language)
@@ -65,7 +73,11 @@ def main(argv: list[str] | None = None) -> int:
             print(create_spotcheck_round(project, document, args.seed, new_run=args.new_run))
             return 0
         if args.command in {"run", "resume"}:
-            outputs = run_project(args.project, base_url=args.base_url, model=args.model, bilingual=args.bilingual, translation_backend=args.translation_backend)
+            outputs = run_project(
+                args.project, base_url=args.base_url, model=args.model, bilingual=args.bilingual,
+                translation_backend=args.translation_backend, agent_executor=agent_executor,
+                agent_model=args.agent_model,
+            )
             print("\n".join(str(path) for path in outputs))
         elif args.command == "build":
             print("\n".join(str(path) for path in build_project(args.project)))

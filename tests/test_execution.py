@@ -288,8 +288,7 @@ class ExecutionContractTests(unittest.TestCase):
     def test_backend_default_is_agent_and_option_two_runs_api(self):
         default_args = parser().parse_args(["run", "unused-project"])
         self.assertEqual(default_args.translation_backend, 1)
-        with self.assertRaisesRegex(NotImplementedError, "AGENT_BACKEND_NOT_IMPLEMENTED"):
-            select_translation_backend(1)
+        self.assertEqual(select_translation_backend(1), "agent")
         self.assertEqual(select_translation_backend(2), "api")
 
         project, _ = self.project("# First\n\nHello.\n")
@@ -310,16 +309,16 @@ class ExecutionContractTests(unittest.TestCase):
         run_state = read_json(project / "state" / "state.json")
         self.assertEqual((run_state["requested_backend"], run_state["actual_backend"]), (2, 2))
 
-    def test_backend_one_does_not_fall_back_or_call_api(self):
+    def test_backend_one_unavailable_fails_without_falling_back_or_calling_api(self):
         project, _ = self.project()
         provider = ApiProvider()
-        with self.assertRaisesRegex(NotImplementedError, "AGENT_BACKEND_NOT_IMPLEMENTED"):
+        with self.assertRaisesRegex(RuntimeError, "AGENT_BACKEND_UNAVAILABLE"):
             run_project(project, provider=provider, translation_backend=1)
         self.assertEqual(provider.translation_calls, 0)
         stderr = StringIO()
         with redirect_stderr(stderr):
             self.assertEqual(main(["run", str(project)]), 1)
-        self.assertIn("AGENT_BACKEND_NOT_IMPLEMENTED", stderr.getvalue())
+        self.assertIn("AGENT_BACKEND_UNAVAILABLE", stderr.getvalue())
 
 
 if __name__ == "__main__":
