@@ -81,7 +81,7 @@ class AgentBackendTests(unittest.TestCase):
         self.repo = Path(__file__).parents[1]
         self.language = load_language_package("en", "zh-Hans")
         self.temp_root = self.repo / "projects" / f".test-agent-{uuid.uuid4().hex}"
-        self.temp_root.mkdir()
+        self.temp_root.mkdir(parents=True)
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):

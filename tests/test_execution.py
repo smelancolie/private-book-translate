@@ -45,7 +45,7 @@ class ExecutionContractTests(unittest.TestCase):
     def setUp(self):
         self.repo = Path(__file__).parents[1]
         self.temp_root = self.repo / "projects" / f".test-execution-{uuid.uuid4().hex}"
-        self.temp_root.mkdir()
+        self.temp_root.mkdir(parents=True)
         self.addCleanup(self._cleanup)
 
     def _cleanup(self):
