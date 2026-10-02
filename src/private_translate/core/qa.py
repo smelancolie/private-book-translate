@@ -8,12 +8,16 @@ from typing import Protocol
 
 from .batching import review_batches, translation_batches
 from .execution import (
+    PatchConflict,
     apply_translation_patch,
     create_review_task,
     create_translation_task,
     load_translation_task,
+    load_review_task_state,
     review_target_digest,
+    set_review_task_status,
     validate_review_evidence_current,
+    validate_review_task_current,
     validate_translation_patch,
 )
 from .glossary import consistency_issues
@@ -65,9 +69,85 @@ def _translate_fixes(units: list[TranslationUnit], provider: TranslationProvider
     return translations
 
 
-def _append_round(path: Path, rounds: list[dict], record: dict) -> None:
+def _append_round(path: Path, rounds: list[dict], record: dict) -> dict:
+    task_ids = set(record.get("evidence_task_ids", []))
+    if task_ids:
+        project = path.parents[2]
+        document = Document.from_dict(read_json(project / "work" / "document.json"))
+        digest = review_target_digest([
+            {"unit_id": unit.id, "target_text": unit.target_text or ""}
+            for unit in document.units if unit.section_id == path.stem and unit.translatable
+        ])
+        if digest != record["target_digest"]:
+            raise PatchConflict("STALE_REVIEW_ROUND: chapter target changed")
+        for task_id in task_ids:
+            state_path = project / "work" / "task-state" / "review" / f"{task_id}.json"
+            if state_path.exists() and read_json(state_path)["status"] in {"superseded", "rejected"}:
+                raise PatchConflict("REVIEW_ROUND_CONFLICT: task is superseded or rejected")
+    for previous in reversed(rounds):
+        if task_ids & set(previous.get("evidence_task_ids", [])):
+            if (task_ids != set(previous["evidence_task_ids"])
+                    or record["target_digest"] != previous["target_digest"]
+                    or record.get("issues", []) != previous.get("issues", [])):
+                raise PatchConflict("REVIEW_ROUND_CONFLICT: evidence already belongs to another round")
+            return previous
     rounds.append(record)
     write_json(path, {"rounds": rounds, "latest_round_status": record["latest_round_status"]})
+    return record
+
+
+def _agent_review_evidence(project: Path, document: Document, candidate: dict,
+                           executor: ReviewExecutor, model: str) -> dict:
+    task = candidate
+    control = project / "qa" / "chapter-controls" / f"{task['chapter_id']}.json"
+    rounds = read_json(control).get("rounds", []) if control.exists() else []
+    for path in sorted((project / "work" / "tasks" / "review").glob("*.json")):
+        saved = read_json(path)
+        if saved["chapter_id"] != candidate["chapter_id"]:
+            continue
+        state_path = project / "work" / "task-state" / "review" / f"{saved['task_id']}.json"
+        try:
+            validate_review_task_current(document, saved)
+        except PatchConflict as error:
+            if not state_path.exists() or read_json(state_path)["status"] not in {"superseded", "rejected"}:
+                set_review_task_status(project, saved, "superseded", reason=str(error))
+            continue
+        if any(saved[key] != candidate[key] for key in
+               ("reviewer_id", "translation_owner_id", "source_units", "target_units", "rubric")):
+            continue
+        full_digest = saved["context_capsule"].get("chapter_target_digest")
+        if full_digest is None:
+            full_digest = next((row.get("target_digest") for row in reversed(rounds)
+                                if saved["task_id"] in row.get("evidence_task_ids", [])), None)
+        if full_digest is not None and full_digest != candidate["context_capsule"]["chapter_target_digest"]:
+            if not state_path.exists() or read_json(state_path)["status"] not in {"superseded", "rejected"}:
+                set_review_task_status(project, saved, "superseded", reason="chapter target changed")
+            continue
+        state = load_review_task_state(project, saved)
+        if state["status"] in {"superseded", "rejected"}:
+            raise PatchConflict(f"REVIEW_TASK_{state['status'].upper()}: {saved['task_id']}")
+        task = saved
+        break
+    else:
+        write_json(project / "work" / "tasks" / "review" / f"{task['task_id']}.json", task)
+        set_review_task_status(project, task, "pending")
+        state = {"status": "pending"}
+    evidence_path = project / "qa" / "review-evidence" / f"{task['task_id']}.json"
+    if state["status"] == "completed" or evidence_path.exists():
+        # Missing completed output is an error, never permission to redispatch.
+        evidence = read_json(evidence_path)
+    else:
+        evidence = executor.execute(task, model=model)
+    try:
+        validate_review_evidence_current(project, evidence, task)
+    except ValueError as error:
+        status = "superseded" if str(error).startswith("STALE_REVIEW") else "rejected"
+        set_review_task_status(project, task, status, reason=str(error))
+        raise
+    if state["status"] != "completed":
+        write_json(evidence_path, evidence)
+        set_review_task_status(project, task, "completed", evidence=str(evidence_path.relative_to(project)))
+    return evidence
 
 
 def run_chapter_qa(project: Path, document: Document, provider: TranslationProvider, language: dict, glossary: list[dict[str, str]], section_ids: set[str] | None = None) -> None:
@@ -145,7 +225,7 @@ def run_chapter_qa(project: Path, document: Document, provider: TranslationProvi
 def _agent_review_fixes(
     project: Path, document: Document, chapter_id: str, issues: list[dict],
     provider: TranslationProvider, language: dict, glossary: list[dict[str, str]],
-    executor: ReviewExecutor, owner_id: str, model: str,
+    executor: ReviewExecutor, owner_id: str, model: str, review_round: dict, rounds: list[dict],
 ) -> tuple[Document, int]:
     issue_ids = {issue["unit_id"] for issue in issues}
     selected = [unit for unit in document.units if unit.section_id == chapter_id and unit.id in issue_ids]
@@ -160,6 +240,9 @@ def _agent_review_fixes(
                            "translation_batch": json.loads(batch_context)},
         )
         task = load_translation_task(project, task_path.stem)
+        review_round.setdefault("fix_task_ids", []).append(task["task_id"])
+        control = project / "qa" / "chapter-controls" / f"{chapter_id}.json"
+        write_json(control, {"rounds": rounds, "latest_round_status": review_round["latest_round_status"]})
         patch = executor.execute(task, model=model)
         if not isinstance(patch, dict):
             raise ValueError("Agent executor must return a TranslationPatch object")
@@ -169,6 +252,7 @@ def _agent_review_fixes(
         document = apply_translation_patch(project, patch)
         after = {unit.id: unit.target_text for unit in document.units if unit.id in batch_ids}
         applied += sum(before[unit_id] != after[unit_id] for unit_id in batch_ids)
+        review_round["fixes_applied"] += sum(before[unit_id] != after[unit_id] for unit_id in batch_ids)
         chapter_targets = [
             {"unit_id": unit.id, "target_text": unit.target_text or ""}
             for unit in document.units if unit.section_id == chapter_id and unit.translatable
@@ -180,7 +264,10 @@ def _agent_review_fixes(
             "patch": patch, "accepted_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "base_chapter_digest": task["base_chapter_digest"],
             "target_digest_after_merge": review_target_digest(chapter_targets),
+            "review_round": review_round["round"], "review_task_ids": review_round["evidence_task_ids"],
         })
+        review_round["target_digest_after_fixes"] = review_target_digest(chapter_targets)
+        write_json(control, {"rounds": rounds, "latest_round_status": review_round["latest_round_status"]})
     return document, applied
 
 
@@ -200,16 +287,28 @@ def run_chapter_qa_agent(
         target_digest = review_target_digest([
             {"unit_id": unit.id, "target_text": unit.target_text or ""} for unit in translated
         ])
-        latest = rounds[-1] if rounds else {}
-        if (
-            all(unit.qa_status == "passed" and unit.target_text is not None and unit.last_qa_target_hash == content_hash(unit.target_text) for unit in translated)
-            and control_record.get("latest_round_status") == "PASS"
-            and latest.get("reviewer_id") == reviewer_id
-            and latest.get("translation_owner_id") == translation_owner_id
-            and latest.get("coverage_status") == "FULL_CHAPTER_COVERAGE"
-            and latest.get("target_digest") == target_digest
-        ):
+        passed = next((row for row in reversed(rounds) if
+                       row.get("scope") == "FULL_CHAPTER"
+                       and row.get("latest_round_status") == "PASS"
+                       and row.get("issues_found") == 0
+                       and row.get("coverage_status") == "FULL_CHAPTER_COVERAGE"
+                       and row.get("target_digest") == target_digest
+                       and row.get("evidence_task_ids")
+                       and all(not (project / "work" / "task-state" / "review" / f"{task_id}.json").exists()
+                               or read_json(project / "work" / "task-state" / "review" / f"{task_id}.json")["status"] == "completed"
+                               for task_id in row["evidence_task_ids"])), None)
+        if passed is not None:
+            for unit in translated:
+                unit.qa_status = "passed"
+                unit.last_qa_target_hash = content_hash(unit.target_text)
+                unit.last_error = None
+            control_record["latest_round_status"] = "PASS"
+            write_json(control, control_record)
+            _save_document(project, document)
             continue
+        if control_record.get("latest_round_status") == "PASS":
+            control_record["latest_round_status"] = "STALE"
+            write_json(control, control_record)
         for _ in range(REVIEWS_PER_INVOCATION):
             context = json.dumps({"section_title": section.title}, ensure_ascii=False)
             batches = review_batches(translated, provider, language, context, language["review_rubric"])
@@ -232,13 +331,8 @@ def run_chapter_qa_agent(
                     },
                     unit_ids=[unit.id for unit in batch],
                 )
-                task_path = project / "work" / "tasks" / "review" / f"{task['task_id']}.json"
-                write_json(task_path, task)
-                evidence = executor.execute(task, model=review_model)
-                validate_review_evidence_current(project, evidence, task)
-                evidence_path = project / "qa" / "review-evidence" / f"{task['task_id']}.json"
-                write_json(evidence_path, evidence)
-                evidence_task_ids.append(task["task_id"])
+                evidence = _agent_review_evidence(project, document, task, executor, review_model)
+                evidence_task_ids.append(evidence["task_id"])
                 issues.extend(evidence["issues"])
 
             full_target_digest = review_target_digest([
@@ -254,7 +348,9 @@ def run_chapter_qa_agent(
                     "target_digest": full_target_digest, "issues_found": 0, "fixes_applied": 0,
                     "unresolved_blocking_issues": 0, "latest_round_status": "PASS", "allow_next_chapter": True,
                 }
-                _append_round(control, rounds, record)
+                record = _append_round(control, rounds, record)
+                record.update(latest_round_status="PASS", allow_next_chapter=True, unresolved_blocking_issues=0)
+                write_json(control, {"rounds": rounds, "latest_round_status": "PASS"})
                 for unit in translated:
                     unit.qa_status = "passed"
                     unit.last_qa_target_hash = target_hashes[unit.id]
@@ -272,13 +368,15 @@ def run_chapter_qa_agent(
                 "latest_round_status": "FIXED_RECHECK_REQUIRED", "allow_next_chapter": False,
                 "issues": issues,
             }
-            _append_round(control, rounds, record)
+            record = _append_round(control, rounds, record)
+            if record.get("fixes_completed") or record.get("fixes_applied", 0):
+                raise RuntimeError("H3_FIX_NO_TARGET_CHANGE: completed fixes require a changed target before recheck")
             if translation_backend == 1:
                 if translation_executor is None:
                     raise RuntimeError("AGENT_FIX_BACKEND_UNAVAILABLE: translation owner is unavailable")
                 document, applied = _agent_review_fixes(
                     project, document, section.section_id, issues, provider, language, glossary,
-                    translation_executor, translation_owner_id, translation_model,
+                    translation_executor, translation_owner_id, translation_model, record, rounds,
                 )
             else:
                 issue_ids = {issue["unit_id"] for issue in issues}
@@ -291,8 +389,13 @@ def run_chapter_qa_agent(
                     unit.qa_status = "pending"
                     unit.last_qa_target_hash = None
                 _save_document(project, document)
-            rounds[-1]["fixes_applied"] = applied
-            _append_round(control, rounds[:-1], rounds[-1])
+            record["fixes_applied"] = applied
+            record["fixes_completed"] = True
+            record["target_digest_after_fixes"] = review_target_digest([
+                {"unit_id": unit.id, "target_text": unit.target_text or ""}
+                for unit in document.units if unit.section_id == section.section_id and unit.translatable
+            ])
+            write_json(control, {"rounds": rounds, "latest_round_status": record["latest_round_status"]})
             document = Document.from_dict(read_json(project / "work" / "document.json"))
             translated = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable]
         else:
