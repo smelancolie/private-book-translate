@@ -512,7 +512,8 @@ class EpubAdapter:
                 is_xhtml = any(item["path"] == item_path and item["media_type"] == "application/xhtml+xml" for item in document.structure["manifest"].values())
                 if not bilingual and is_xhtml:
                     _set_language(root, target_language)
-                updates[item_path] = etree.tostring(root, encoding="utf-8", xml_declaration=True, doctype=root.getroottree().docinfo.doctype or None)
+                doctype = "<!DOCTYPE html>" if is_xhtml else root.getroottree().docinfo.doctype or None
+                updates[item_path] = etree.tostring(root, encoding="utf-8", xml_declaration=True, doctype=doctype)
 
             if package_path in names:
                 package = etree.fromstring(source.read(package_path), _parser())
@@ -522,7 +523,28 @@ class EpubAdapter:
                     title = package.xpath(unit.locator["xpath"])[0]
                     title.text = f"{unit.source_text} — {unit.target_text}" if bilingual else unit.target_text
                 _set_package_languages(package, document.source_language, target_language, bilingual)
-                updates[package_path] = etree.tostring(package, encoding="utf-8", xml_declaration=True, doctype=package.getroottree().docinfo.doctype or None)
+                package_xml = etree.tostring(package, encoding="utf-8", xml_declaration=False, doctype=package.getroottree().docinfo.doctype or None)
+                updates[package_path] = b'<?xml version="1.0" encoding="UTF-8"?>\n' + package_xml
+
+                identifier_id = package.get("unique-identifier")
+                identifier = package.xpath(
+                    ".//*[local-name()='metadata']/*[local-name()='identifier'][@id=$identifier_id]",
+                    identifier_id=identifier_id,
+                )[0]
+                identifier_value = "".join(identifier.itertext())
+                for item in document.structure["manifest"].values():
+                    if item["media_type"] != NCX_MEDIA_TYPE:
+                        continue
+                    ncx_path = item["path"]
+                    ncx = etree.fromstring(updates.get(ncx_path, source.read(ncx_path)), _parser())
+                    ncx_uids = ncx.xpath(".//*[local-name()='meta'][@name='dtb:uid']")
+                    if any(ncx_uid.get("content") != identifier_value for ncx_uid in ncx_uids):
+                        for ncx_uid in ncx_uids:
+                            ncx_uid.set("content", identifier_value)
+                        updates[ncx_path] = etree.tostring(
+                            ncx, encoding="utf-8", xml_declaration=True,
+                            doctype=ncx.getroottree().docinfo.doctype or None,
+                        )
 
             with zipfile.ZipFile(output_path, "w") as result:
                 ordered = source.infolist()
