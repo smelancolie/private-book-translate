@@ -194,24 +194,32 @@ class AgentSpotcheckTests(unittest.TestCase):
         issue_ids = {finding["unit_id"] for reviewer in reviews for finding in reviewer["findings"]}
         family = read_json(first_dir / "closure-required.json")["families"][0]
         issue_id = next(iter(issue_ids))
-        unit = next(unit for unit in self.document.units if unit.id == issue_id)
-        baseline_hash = next(item["target_hash"] for item in sample["samples"] if item["unit_id"] == issue_id)
-        unit.target_text = "晨光洒向安静的港湾。"
-        unit.last_qa_target_hash = content_hash(unit.target_text)
+        changed_ids = {issue_id, next(item["unit_id"] for item in sample["samples"] if item["unit_id"] != issue_id)}
+        units_by_id = {unit.id: unit for unit in self.document.units}
+        sample_hashes = {item["unit_id"]: item["target_hash"] for item in sample["samples"]}
+        for unit_id in changed_ids:
+            unit = units_by_id[unit_id]
+            unit.target_text = f"修订后的译文：{unit_id}"
+            unit.qa_status = "passed"
+            unit.last_qa_target_hash = content_hash(unit.target_text)
         self._save_current()
         closure_family = {
             **family, "audit_method": "Audited every paragraph, table, figure, formula and caption or note in the book.",
-            "audit_results": {candidate.id: ("fixed" if candidate.id == issue_id else "clear") for candidate in self.document.units},
-            "fixes": {issue_id: {
-                "baseline_target_hash": baseline_hash, "target_hash": content_hash(unit.target_text),
-                "resolution": "Reordered the clause into natural Simplified Chinese.",
-            }}, "exceptions": {}, "closure_status": "CLOSED",
+            "audit_results": {candidate.id: ("fixed" if candidate.id in changed_ids else "clear") for candidate in self.document.units},
+            "fixes": {
+                unit_id: {
+                    "baseline_target_hash": sample_hashes[unit_id],
+                    "target_hash": content_hash(units_by_id[unit_id].target_text),
+                    "resolution": "Reordered the clause into natural Simplified Chinese.",
+                }
+                for unit_id in changed_ids
+            }, "exceptions": {}, "closure_status": "CLOSED",
         }
         closure = {"run_id": sample["run_id"], "round_id": sample["round_id"], "round": 1, "families": [closure_family]}
         unresolved = json.loads(json.dumps(closure))
         unresolved_family = unresolved["families"][0]
         unresolved_family["audit_results"][issue_id] = "exception"
-        unresolved_family["fixes"] = {}
+        unresolved_family["fixes"].pop(issue_id)
         unresolved_family["exceptions"] = {issue_id: "Leave the confirmed issue unresolved."}
         with self.assertRaisesRegex(ValueError, "must fix every reported sample defect"):
             close_spotcheck_defect_families(self.project, self.document, first_dir, unresolved)

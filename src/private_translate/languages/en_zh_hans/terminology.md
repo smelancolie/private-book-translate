@@ -1,1 +1,3 @@
 Keep recurring concepts, specialist terms, headings, and titles consistent throughout the book. Follow approved glossary entries exactly, including forbidden translations. Preserve technical distinctions and established English terminology when a Chinese equivalent would be misleading.
+
+Keep social concepts distinct from behavior, identity, orientation, and desire. Preserve attribution for stereotypes and disputed claims; do not infer consent or willingness without source support. Translate slurs by local force, function, and register, distinguishing analysis, quotation, teasing, and direct insult.

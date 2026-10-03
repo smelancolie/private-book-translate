@@ -1,1 +1,3 @@
 Review every supplied source and target unit for fidelity, complete meaning, fluent Simplified Chinese, contextual word sense, omissions, unsupported additions, references, titles, quotations, notes, punctuation, and consistent terminology. Report only concrete fixable issues, with the affected unit ID. After any repair, require a new full chapter review with zero issues before passing. Return JSON with an issues array.
+
+Check register: academic/spoken, slang, loaded wording; avoid flattening.

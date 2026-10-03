@@ -13,8 +13,8 @@ from private_translate.core.qa import run_book_consistency
 
 
 class RecordingProvider:
-    def __init__(self, fail_on_call=None):
-        self.capabilities = ProviderCapabilities("fake", "small-context", 1200, 100, True, False)
+    def __init__(self, fail_on_call=None, context_window=1200):
+        self.capabilities = ProviderCapabilities("fake", "small-context", context_window, 100, True, False)
         self.translation_calls = []
         self.review_calls = []
         self.fail_on_call = fail_on_call
@@ -73,7 +73,7 @@ class BatchingTests(unittest.TestCase):
         source = self.root / "book.md"
         source.write_text("# Chapter\n\n" + "\n\n".join(f"Paragraph {i} contains several ordinary words." for i in range(paragraph_count)), encoding="utf-8")
         project = create_project(source, self.root / "projects")
-        provider = RecordingProvider()
+        provider = RecordingProvider(context_window=1500)
 
         run_project(project, provider=provider)
 
@@ -108,7 +108,7 @@ class BatchingTests(unittest.TestCase):
         source = self.root / "book.md"
         source.write_text("# Chapter\n\n" + "\n\n".join(f"Paragraph {i} contains several ordinary words." for i in range(16)), encoding="utf-8")
         project = create_project(source, self.root / "projects")
-        provider = RecordingProvider(fail_on_call=2)
+        provider = RecordingProvider(fail_on_call=2, context_window=1500)
 
         with self.assertRaisesRegex(RuntimeError, "temporary provider failure"):
             run_project(project, provider=provider)

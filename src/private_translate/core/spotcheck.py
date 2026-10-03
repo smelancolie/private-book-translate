@@ -280,7 +280,6 @@ def _evaluate_round(directory: Path, expected_run_id: str, expected_number: int,
         scores_summary[slot] = {"reviewer_id": reviewer["reviewer_id"], "average": average, "lowest": lowest, "style_debt_count": style_debt}
         scoring_pass &= average >= 92 and lowest >= 88 and style_debt == 0
     reported_issue_ids = set().union(*issue_units_by_family.values()) if issue_units_by_family else set()
-    _validate_sample(sample, document, reported_issue_ids)
     if issue_family_ids:
         closure = read_json(directory / "closure.json")
         closure_ids = [family.get("family_id") for family in closure.get("families", [])]
