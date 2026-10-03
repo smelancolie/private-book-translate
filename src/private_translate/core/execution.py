@@ -463,7 +463,7 @@ def apply_translation_patch(project: Path, patch: dict) -> Document:
     if updated:
         write_json(document_path, document.to_dict())
         control = project / "qa" / "chapter-controls" / f"{task['chapter_id']}.json"
-        if control.exists():
+        if target_changed and control.exists():
             record = read_json(control)
             record["latest_round_status"] = "STALE"
             write_json(control, record)
@@ -501,7 +501,13 @@ def create_review_task(
         "chapter_id": chapter_id, "reviewer_id": reviewer_id, "translation_owner_id": translation_owner_id,
         "base_chapter_digest": chapter_digest(document, chapter_id), "target_digest": review_target_digest(target_units),
         "source_units": [{"unit_id": unit.id, "source_hash": unit.source_hash, "source_text": unit.source_text} for unit in units],
-        "target_units": target_units, "rubric": rubric, "context_capsule": context_capsule or {},
+        "target_units": target_units, "rubric": rubric,
+        "context_capsule": {
+            **(context_capsule or {}),
+            "chapter_target_digest": review_target_digest([
+                {"unit_id": unit.id, "target_text": unit.target_text or ""} for unit in chapter_units
+            ]),
+        },
         "required_evidence_schema": SCHEMAS["ReviewEvidence"],
     }
     validate_review_task(task)
@@ -547,15 +553,75 @@ def validate_review_evidence(evidence: dict, task: dict) -> None:
 def validate_review_evidence_current(project: Path, evidence: dict, task: dict) -> None:
     project = project.resolve(strict=True)
     validate_review_evidence(evidence, task)
+    state_path = project / "work" / "task-state" / "review" / f"{task['task_id']}.json"
+    if state_path.exists():
+        status = read_json(state_path)["status"]
+        if status in {"superseded", "rejected"}:
+            raise PatchConflict(f"REVIEW_TASK_{status.upper()}: evidence cannot be accepted")
     document = Document.from_dict(read_json(project / "work" / "document.json"))
-    if chapter_digest(document, task["chapter_id"]) != task["base_chapter_digest"]:
-        raise PatchConflict("STALE_REVIEW_TASK: chapter changed since review task export")
+    validate_review_task_current(document, task)
+    if (task["context_capsule"].get("chapter_target_digest") is None
+            and chapter_digest(document, task["chapter_id"]) != task["base_chapter_digest"]):
+        targets = [{"unit_id": unit.id, "target_text": unit.target_text or ""}
+                   for unit in document.units if unit.section_id == task["chapter_id"] and unit.translatable]
+        if {unit["unit_id"] for unit in task["source_units"]} == {unit["unit_id"] for unit in targets}:
+            previous_digest = task["target_digest"]
+        else:
+            control = project / "qa" / "chapter-controls" / f"{task['chapter_id']}.json"
+            rounds = read_json(control).get("rounds", []) if control.exists() else []
+            previous_digest = next((row.get("target_digest") for row in reversed(rounds)
+                                    if task["task_id"] in row.get("evidence_task_ids", [])), None)
+            if previous_digest is None:
+                raise PatchConflict("REVIEW_TASK_STATE_UNKNOWN: legacy batch lacks chapter target provenance")
+        if previous_digest != review_target_digest(targets):
+            raise PatchConflict("STALE_REVIEW_TASK: legacy chapter target changed")
+    evidence_path = project / "qa" / "review-evidence" / f"{task['task_id']}.json"
+    if evidence_path.exists() and read_json(evidence_path) != evidence:
+        raise PatchConflict("REVIEW_EVIDENCE_CONFLICT: task already has different evidence")
+
+
+def validate_review_task_current(document: Document, task: dict) -> None:
+    # QA bookkeeping is not a target revision; review freshness follows content.
     current = {unit.id: unit for unit in document.units if unit.section_id == task["chapter_id"]}
     current_targets = []
     for source, target in zip(task["source_units"], task["target_units"], strict=True):
         unit = current.get(source["unit_id"])
-        _require(unit is not None and unit.source_hash == source["source_hash"], "STALE_REVIEW_TASK: source unit changed")
-        _require(unit.target_text is not None and unit.target_text == target["target_text"], "STALE_REVIEW_EVIDENCE: current target changed")
+        if unit is None or unit.source_hash != source["source_hash"]:
+            raise PatchConflict("STALE_REVIEW_TASK: source unit changed")
+        if unit.target_text != target["target_text"]:
+            raise PatchConflict("STALE_REVIEW_EVIDENCE: current target changed")
         current_targets.append({"unit_id": unit.id, "target_text": unit.target_text})
     if review_target_digest(current_targets) != task["target_digest"]:
         raise PatchConflict("STALE_REVIEW_EVIDENCE: current target digest changed")
+    full_digest = task["context_capsule"].get("chapter_target_digest")
+    if full_digest is not None and full_digest != review_target_digest([
+        {"unit_id": unit.id, "target_text": unit.target_text or ""}
+        for unit in document.units if unit.section_id == task["chapter_id"] and unit.translatable
+    ]):
+        raise PatchConflict("STALE_REVIEW_TASK: chapter target changed")
+
+
+def set_review_task_status(project: Path, task: dict, status: str, **details) -> dict:
+    _require(status in {"pending", "completed", "superseded", "rejected"}, "Invalid review task status")
+    path = project / "work" / "task-state" / "review" / f"{task['task_id']}.json"
+    state = read_json(path) if path.exists() else {"task_id": task["task_id"], "history": []}
+    state["status"] = status
+    state["history"].append({"status": status, "at": datetime.now(timezone.utc).isoformat(), **details})
+    write_json(path, state)
+    return state
+
+
+def load_review_task_state(project: Path, task: dict) -> dict:
+    path = project / "work" / "task-state" / "review" / f"{task['task_id']}.json"
+    if path.exists():
+        return read_json(path)
+    # Recover legacy completion only from positive records, never file absence.
+    control = project / "qa" / "chapter-controls" / f"{task['chapter_id']}.json"
+    rounds = read_json(control).get("rounds", []) if control.exists() else []
+    referenced = any(task["task_id"] in row.get("evidence_task_ids", []) for row in rounds)
+    evidence = project / "qa" / "review-evidence" / f"{task['task_id']}.json"
+    if referenced or evidence.exists():
+        if evidence.exists():
+            validate_review_evidence(read_json(evidence), task)
+        return set_review_task_status(project, task, "completed", reason="legacy completion record")
+    raise PatchConflict(f"REVIEW_TASK_STATE_UNKNOWN: {task['task_id']}; explicit lifecycle required")
