@@ -64,9 +64,12 @@ def _dispatch(task: dict, model: str) -> dict:
             "worker_id": task.get("owner_id") or task["reviewer_id"]}
 
 
-def _validate_auxiliary_task_current(project: Path, task: dict) -> None:
+def _validate_auxiliary_task_current(project: Path, task: dict, result: dict | None = None) -> None:
     if task["task_type"] == "terminology":
-        validate_terminology_task_current(project, task)
+        if result is None:
+            validate_terminology_task_current(project, task)
+        else:
+            validate_terminology_result(project, result, task, allow_applied=True)
     elif task["task_type"] == "book_consistency":
         validate_book_consistency_task_current(project, task)
     elif task["task_type"] == "translation" and (task["context_capsule"].get("batch") or {}).get("consistency_issues"):
@@ -162,7 +165,8 @@ def advance_host_run(
             raise ValueError("Finish the pending host spotcheck before running the project")
         assert_project_source_current(project)
         task = read_json(_request_path(project))["tasks"][0]["task"]
-        _validate_auxiliary_task_current(project, task)
+        result = read_json(_response_path(project, task["task_id"])) if pending["status"] == "results_ready" else None
+        _validate_auxiliary_task_current(project, task, result)
         if pending["status"] == "awaiting_host":
             return pending
         stop_after_terminology = task["task_type"] == "terminology"

@@ -282,7 +282,9 @@ def _validate_terminology_task_shape(task: object) -> dict:
     return task
 
 
-def validate_terminology_task_current(project: Path, task: dict) -> None:
+def validate_terminology_task_current(
+    project: Path, task: dict, *, applied_proposals: list[dict[str, str]] | None = None,
+) -> None:
     task = _validate_terminology_task_shape(task)
     project = project.resolve(strict=True)
     task_path = _terminology_task_path(project, task["task_id"])
@@ -302,25 +304,41 @@ def validate_terminology_task_current(project: Path, task: dict) -> None:
 
     candidate_rows = _candidate_rows_by_source(project / "glossary" / "candidates.csv")
     discovered = {row["source"].casefold(): row for row in discover_candidates(document)}
+    expected_rows = {snapshot["source"].casefold(): snapshot["candidate_row"]
+                     for snapshot in task["candidate_snapshots"]}
+    if applied_proposals is not None:
+        proposed_rows = {
+            proposal["source"].casefold(): {
+                **expected_rows[proposal["source"].casefold()],
+                "preferred_translation": proposal["preferred_translation"],
+            }
+            for proposal in applied_proposals
+        }
+        # candidates.csv is replaced atomically: accept the complete before or after state.
+        if all(candidate_rows.get(key) == row for key, row in proposed_rows.items()):
+            expected_rows = proposed_rows
     for snapshot in task["candidate_snapshots"]:
         source = snapshot["source"]
         key = source.casefold()
         current_row = candidate_rows.get(key)
         current_discovery = discovered.get(key)
-        if current_row != snapshot.get("candidate_row"):
+        if current_row != expected_rows[key]:
             raise ValueError(f"STALE_TERMINOLOGY_TASK: candidate row changed for {source!r}")
         if current_discovery is not None and current_discovery["source"] != source:
             raise ValueError(f"STALE_TERMINOLOGY_TASK: candidate source changed for {source!r}")
         current_snapshot = _terminology_candidate_snapshot(current_discovery, current_row)
-        if current_snapshot != snapshot:
+        if current_snapshot != {**snapshot, "candidate_row": expected_rows[key]}:
             raise ValueError(f"STALE_TERMINOLOGY_TASK: source context changed for {source!r}")
-        if current_row["status"] != "proposed" or current_row["preferred_translation"]:
+        if current_row["status"] != "proposed" or (
+            current_row["preferred_translation"] and applied_proposals is None
+        ):
             raise ValueError(f"STALE_TERMINOLOGY_TASK: candidate is no longer pending for {source!r}")
 
 
-def validate_terminology_result(project: Path, result: dict, task: dict) -> list[dict[str, str]]:
+def validate_terminology_result(
+    project: Path, result: dict, task: dict, *, allow_applied: bool = False,
+) -> list[dict[str, str]]:
     task = _validate_terminology_task_shape(task)
-    validate_terminology_task_current(project, task)
     if (
         not isinstance(result, dict)
         or set(result) != {"schema_version", "task_id", "owner_id", "proposals"}
@@ -350,10 +368,14 @@ def validate_terminology_result(project: Path, result: dict, task: dict) -> list
     if set(proposals) != set(expected):
         missing = [source for key, source in expected.items() if key not in proposals]
         raise ValueError(f"Missing terminology proposals: {', '.join(missing)}")
-    return [
+    proposals = [
         {"source": source, "preferred_translation": proposals[key]}
         for key, source in expected.items()
     ]
+    validate_terminology_task_current(
+        project, task, applied_proposals=proposals if allow_applied else None,
+    )
+    return proposals
 
 
 def _pending_terminology_task(project: Path, pending_keys: set[str]) -> dict | None:

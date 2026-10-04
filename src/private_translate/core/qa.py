@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import re
@@ -132,8 +133,8 @@ def _agent_review_evidence(project: Path, document: Document, candidate: dict,
         task = saved
         break
     else:
-        write_json(project / "work" / "tasks" / "review" / f"{task['task_id']}.json", task)
         set_review_task_status(project, task, "pending")
+        write_json(project / "work" / "tasks" / "review" / f"{task['task_id']}.json", task)
         state = {"status": "pending"}
     evidence_path = project / "qa" / "review-evidence" / f"{task['task_id']}.json"
     if state["status"] == "completed" or evidence_path.exists():
@@ -614,8 +615,15 @@ def validate_book_consistency_fix_current(project: Path, task: dict) -> None:
     document = Document.from_dict(read_json(project / "work/document.json"))
     context = task["context_capsule"]["batch"]
     glossary = load_glossary(project / "glossary/terms.csv")
+    expected_targets = {context["book_target_hash"]}
+    archive = project / "work/patches/translation" / f"{task['task_id']}.json"
+    if archive.exists():
+        record = read_json(archive)
+        expected_targets = {record["after_target_hash"]}
+        if record["application_status"] == "pending":
+            expected_targets.add(record["before_target_hash"])
     if (_target_hash([unit for unit in document.units if unit.translatable and unit.target_text is not None])
-            != context["book_target_hash"]
+            not in expected_targets
             or content_hash(json.dumps(glossary, ensure_ascii=False, sort_keys=True)) != context["glossary_hash"]):
         raise PatchConflict("STALE_BOOK_CONSISTENCY_FIX: targets or approved glossary changed")
 
@@ -743,19 +751,34 @@ def run_book_consistency_agent(
             write_json(report_path, report)
         task = load_translation_task(project, active["pending_fix_task_id"])
         archive = project / "work/patches/translation" / f"{task['task_id']}.json"
+        validate_book_consistency_fix_current(project, task)
         if not archive.exists():
-            validate_book_consistency_fix_current(project, task)
             ensure_task_budget(task, fix_budget)
             patch = translation_executor.execute(task, model=translation_model)
+            validate_translation_patch(project, patch)
             before = {unit.id: unit.target_text for unit in document.units if unit.id in batch["unit_ids"]}
-            document = apply_translation_patch(project, patch)
-            changed = sum(unit.target_text != before[unit.id] for unit in document.units if unit.id in before)
+            targets = {row["unit_id"]: row["target_text"] for row in patch["translations"]}
+            changed = sum(targets[unit_id] != text for unit_id, text in before.items())
+            translated = [unit for unit in document.units if unit.translatable and unit.target_text is not None]
+            # Persist the existing patch archive before canonical writes, with exact replay states.
             write_json(archive, {"task_id": task["task_id"], "patch_id": patch["patch_id"],
                                  "chapter_id": task["chapter_id"], "owner_id": task["owner_id"],
                                  "requested_backend": 1, "actual_backend": 1, "model": translation_model,
                                  "patch": patch, "consistency_round": active["round"],
-                                 "fixes_applied": changed})
-        active["fixes_applied"] += read_json(archive)["fixes_applied"]
+                                 "fixes_applied": changed, "application_status": "pending",
+                                 "before_target_hash": _target_hash(translated),
+                                 "after_target_hash": _target_hash([
+                                     replace(unit, target_text=targets.get(unit.id, unit.target_text))
+                                     for unit in translated
+                                 ])})
+        record = read_json(archive)
+        if record["application_status"] == "pending":
+            current_hash = _target_hash([unit for unit in document.units if unit.translatable and unit.target_text is not None])
+            if current_hash == record["before_target_hash"]:
+                document = apply_translation_patch(project, record["patch"])
+            record["application_status"] = "applied"
+            write_json(archive, record)
+        active["fixes_applied"] += record["fixes_applied"]
         active["fix_index"] += 1
         active["pending_fix_task_id"] = None
         report["status"] = "FIXING"
