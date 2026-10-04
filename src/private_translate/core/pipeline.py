@@ -13,7 +13,10 @@ from private_translate.formats.epub import EpubAdapter
 from .glossary import load_glossary, prepare_terminology
 from .language import load_language_package
 from .model import Document
-from .batching import maximum_unit_tokens, split_oversized_units, translation_batches
+from .batching import (
+    ensure_task_budget, fit_task_batches, maximum_unit_tokens, provider_budgets,
+    split_oversized_units, translation_batches,
+)
 from .providers import OpenAICompatibleProvider, ProviderCapabilities, TranslationProvider
 from .qa import (
     _target_hash, run_book_consistency, run_book_consistency_agent,
@@ -23,6 +26,7 @@ from .spotcheck import validate_spotcheck
 from .execution import (
     PatchConflict,
     apply_translation_patch,
+    build_translation_task,
     create_translation_task,
     load_translation_task,
     review_target_digest,
@@ -101,18 +105,29 @@ def _translate_agent(
     resume_task_id: str | None = None,
 ) -> Document:
     owner_id = "agent:translation-owner"
+    budget = provider_budgets(capabilities, language)["translation_batch_target_tokens"]
     for section, units in _pending_by_section(document):
         context = json.dumps({"section": section.title}, ensure_ascii=False)
+        def pack(group):
+            return [(batch, batch_context) for batch, batch_context, _ in
+                    translation_batches(group, capabilities, language, context, glossary)]
+
+        def draft(batch, batch_context):
+            return build_translation_task(
+                project, document, section.section_id, owner_id,
+                unit_ids=[unit.id for unit in batch], batch_context=json.loads(batch_context),
+            )
+
         if resume_task_id is not None:
             saved = load_translation_task(project, resume_task_id)
             selected = set(saved["unit_ids"])
             batch = [unit for unit in units if unit.id in selected]
             remaining = [unit for unit in units if unit.id not in selected]
-            batches = [(batch, json.dumps(saved["context_capsule"]["batch"], ensure_ascii=False), [])]
-            batches.extend(translation_batches(remaining, capabilities, language, context, glossary))
+            batches = [(batch, json.dumps(saved["context_capsule"]["batch"], ensure_ascii=False))]
+            batches.extend(fit_task_batches(remaining, budget, pack, draft))
         else:
-            batches = translation_batches(units, capabilities, language, context, glossary)
-        for batch, batch_context, _ in batches:
+            batches = fit_task_batches(units, budget, pack, draft)
+        for batch, batch_context in batches:
             task_path = create_translation_task(
                 project, section.section_id, owner_id,
                 unit_ids=[unit.id for unit in batch], batch_context=json.loads(batch_context),
@@ -121,6 +136,7 @@ def _translate_agent(
             resume_task_id = None
             task = load_translation_task(project, task_path.stem)
             for attempt in range(2):
+                ensure_task_budget(task, budget)
                 patch = executor.execute(task, model=model)
                 if not isinstance(patch, dict):
                     raise ValueError("Agent executor must return a TranslationPatch object")

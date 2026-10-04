@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 from pathlib import Path
 import tempfile
 import time
@@ -142,6 +143,7 @@ class LargeBookTests(unittest.TestCase):
                 f"review_calls={len(provider.review_requests)}, resumed_units=1"
             )
 
+    @unittest.skipUnless(os.environ.get("GITHUB_ACTIONS") == "true", "Large-book regression runs in GitHub Actions after push")
     def test_large_book_never_sends_full_book_to_provider(self):
         repo = Path(__file__).parents[1]
         with tempfile.TemporaryDirectory(dir=repo / "tests") as temporary:

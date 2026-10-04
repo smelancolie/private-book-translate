@@ -14,6 +14,10 @@ python -m pip install -e .
 
 包不注册产品终端命令。Python 包、core API 与 `python -m unittest` 测试入口保留。EPUB 总是执行内置 ZIP、package、spine、资源、链接、片段 ID 与 XML 结构验证；如果系统 PATH 中有 `epubcheck`，还会追加运行它。
 
+本地验证使用 `python -m unittest discover -s tests -v`，保留 137 单元的小规模 long-book smoke；50,100 单元大书回归会自动跳过，仅在 GitHub Actions 中执行。现有 `large-book-regression` 任务在相关核心代码或大书测试变更 push 到 `main` 后运行，也支持 `workflow_dispatch` 手动触发。
+
+代码 commit、push 后，若需要大书回归，确认 GitHub 已开始执行大书测试，并等待其他测试任务完成，即可停止等待、报告各任务当前状态及运行链接。大书测试继续在 GitHub 上运行；运行中不算通过。
+
 ### Codex / host integration
 
 宿主通过 `private_translate.host` 直接驱动 core。Python 在需要 Agent 时返回待执行任务，不等待模型或宿主回调；宿主执行任务并提交 JSON 后，再次调用 core 继续。正常 core 异常直接抛出，由宿主呈现错误。
@@ -101,5 +105,7 @@ projects/<id>/
 ```
 
 首次推进会在翻译前本地发现重复专名和术语，并通过宿主 Agent 生成 `glossary/candidates.csv` 提案。人工将条目的 `status` 改为 `approved` 后，下次运行会把它锁入 `terms.csv`；只有 `approved` 项进入强制术语表。`proposed` 与 `rejected` 项不会影响翻译。正式宿主分批使用显式传入的 `ProviderCapabilities` 和现有语言包预算，不依赖 HTTP provider 客户端。
+
+原生任务按完整 JSON（包括规则、ID、哈希、schema、术语和上下文）估算输入 token，并计入既有的请求开销，另预留配置的输出预算。正文翻译、章节复核、全书一致性和修复会继续细分批次；修复只携带本批相关问题。单个单元的完整任务仍超预算时明确报错，不派发超预算任务。估算沿用项目现有算法，实际模型的 token 数仍由宿主决定。已保存的待执行任务恢复时保留原 ID 和内容，不重新分批。
 
 第一版限制：只提供 `en` → `zh-Hans`；不做 OCR；不翻译图片像素、代码、公式语法、URL、CSS 或 JavaScript。支持 EPUB 3 导航与 EPUB 2 NCX；无法读取的加密 EPUB / DRM 会明确拒绝；符合 EPUB 规范的字体混淆项只原样保留，不解密。EPUB XHTML 以原 DOM 为基础改写翻译文本，并保留原 CSS 与其他 ZIP 资源；双语版按块插入目标语。Markdown 依赖 Pandoc AST 并启用 Markdown header attributes，以保留显式标题锚点。当前机器未检测到 `epubcheck` 可执行文件，因此只可报告内置结构验证结果，不能声称 EPUBCheck 已通过。

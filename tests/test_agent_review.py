@@ -23,7 +23,7 @@ from private_translate.formats.markdown import MarkdownAdapter
 
 
 class FakeProvider:
-    capabilities = ProviderCapabilities("fake", "review-test", 2000, 400, True, False)
+    capabilities = ProviderCapabilities("fake", "review-test", 3000, 400, True, False)
 
     def __init__(self):
         self.translation_calls = 0

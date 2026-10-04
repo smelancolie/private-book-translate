@@ -5,6 +5,7 @@ import json
 import math
 import re
 import uuid
+from typing import Callable
 
 from .model import Document, TranslationUnit, content_hash
 from .providers import ProviderCapabilities
@@ -31,6 +32,33 @@ def provider_budgets(capabilities: ProviderCapabilities, language: dict[str, obj
     review = min(int(configured["review_batch_target_tokens"]), max_input)
     return {"max_input_tokens": max_input, "max_output_tokens": max_output,
             "translation_batch_target_tokens": translation, "review_batch_target_tokens": review}
+
+
+def task_input_tokens(task: dict) -> int:
+    return estimate_tokens(json.dumps(task, ensure_ascii=False)) + _REQUEST_OVERHEAD_TOKENS
+
+
+def ensure_task_budget(task: dict, budget: int) -> None:
+    tokens = task_input_tokens(task)
+    if tokens > budget:
+        raise ValueError(f"Host {task['task_type']} task {task['task_id']} exceeds the configured input budget ({tokens} > {budget})")
+
+
+def fit_task_batches(units: list[TranslationUnit], budget: int,
+                     pack: Callable, build_task: Callable) -> list[tuple[list[TranslationUnit], str]]:
+    """Fit the complete native task, keeping the existing bounded context packing."""
+    fitted = []
+    for batch, context in pack(units):
+        task = build_task(batch, context)
+        if task_input_tokens(task) <= budget:
+            fitted.append((batch, context))
+        elif len(batch) > 1:
+            middle = len(batch) // 2
+            fitted.extend(fit_task_batches(batch[:middle], budget, pack, build_task))
+            fitted.extend(fit_task_batches(batch[middle:], budget, pack, build_task))
+        else:
+            ensure_task_budget(task, budget)
+    return fitted
 
 
 def _markers_balanced_before(text: str, position: int) -> bool:

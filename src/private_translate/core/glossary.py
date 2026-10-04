@@ -9,7 +9,7 @@ import re
 import tempfile
 import uuid
 
-from .batching import estimate_tokens, provider_budgets, translation_batches
+from .batching import provider_budgets, task_input_tokens, translation_batches
 from .model import Document, TranslationUnit
 from .providers import ProviderCapabilities
 from .state import read_json, write_json
@@ -391,7 +391,7 @@ def _fit_terminology_batches(
                 project, document, language, source_keys, snapshots, batch_context,
                 len(units) - 1, len(units),
             )
-            if estimate_tokens(json.dumps(draft, ensure_ascii=False)) <= budget:
+            if task_input_tokens(draft) <= budget:
                 fitted.append((batch, batch_context, batch_glossary))
             elif len(batch) > 1:
                 middle = len(batch) // 2

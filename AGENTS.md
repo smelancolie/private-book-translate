@@ -7,6 +7,8 @@
 - Preserve input files and format structure. Reject encrypted content/DRM; preserve standard font obfuscation without decrypting it.
 - Use provider adapters for network calls. Never put API keys in project files or send local files anywhere except the configured provider request.
 - Keep changes small and run `python -m unittest discover -s tests -v` after implementation changes.
+- Run the 50,100-unit large-book regression only in GitHub Actions after push, never locally. Local test discovery skips it automatically; keep the small long-book smoke test enabled locally.
+- After committing and pushing changes that require large-book regression, confirm that GitHub has started the large-book test. Once all other test jobs have completed, you may stop waiting and report the commit, job results, run URL, and the large-book test's current status. Leave the GitHub run active; do not report a running test as passed.
 
 # Codex host integration
 

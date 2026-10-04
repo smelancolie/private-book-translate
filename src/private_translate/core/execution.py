@@ -278,16 +278,15 @@ def _task_path(project: Path, task_id: str) -> Path:
     return project / "work" / "tasks" / "translation" / f"{task_id}.json"
 
 
-def create_translation_task(
-    project: Path, chapter_id: str, owner_id: str, *,
+def build_translation_task(
+    project: Path, document: Document, chapter_id: str, owner_id: str, *,
     proper_noun_slice: list[dict] | None = None,
     proper_noun_occurrences: list[dict] | None = None,
     polysemy_watchlist: list[dict] | None = None,
     unit_ids: list[str] | None = None,
     batch_context: dict | None = None,
-    resume_task_id: str | None = None,
-) -> Path:
-    manifest, document = _project_document(project)
+) -> dict:
+    manifest = read_json(project / "project.json")
     _require(_is_id(owner_id), "owner_id is required")
     _require(batch_context is None or isinstance(batch_context, dict), "batch_context must be an object")
     section = next((item for item in document.sections if item.section_id == chapter_id), None)
@@ -349,6 +348,24 @@ def create_translation_task(
         },
     }
     validate_translation_task(task)
+    return task
+
+
+def create_translation_task(
+    project: Path, chapter_id: str, owner_id: str, *,
+    proper_noun_slice: list[dict] | None = None,
+    proper_noun_occurrences: list[dict] | None = None,
+    polysemy_watchlist: list[dict] | None = None,
+    unit_ids: list[str] | None = None,
+    batch_context: dict | None = None,
+    resume_task_id: str | None = None,
+) -> Path:
+    _, document = _project_document(project)
+    task = build_translation_task(
+        project, document, chapter_id, owner_id, proper_noun_slice=proper_noun_slice,
+        proper_noun_occurrences=proper_noun_occurrences, polysemy_watchlist=polysemy_watchlist,
+        unit_ids=unit_ids, batch_context=batch_context,
+    )
     if resume_task_id is not None:
         saved = load_translation_task(project, resume_task_id)
         transient = {"task_id", "created_at", "base_document_revision"}

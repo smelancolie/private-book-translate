@@ -27,7 +27,7 @@ REVIEW_MODEL = "test:reviewer"
 TERM = "North Star"
 PREFERRED = "北极星"
 FORBIDDEN = "北斗星"
-EMPTY_REVIEW_CAPABILITIES = ProviderCapabilities("test", "small-review", 2048, 256, True, False)
+EMPTY_REVIEW_CAPABILITIES = ProviderCapabilities("test", "small-review", 3000, 256, True, False)
 DEFAULT_CAPABILITIES = ProviderCapabilities("test", "host-consistency", 4096, 1024, True, False)
 
 

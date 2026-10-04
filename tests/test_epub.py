@@ -1,5 +1,9 @@
 from pathlib import Path
+import json
+import os
 import shutil
+import subprocess
+import sys
 import zipfile
 import unittest
 
@@ -196,6 +200,65 @@ class EpubPipelineTests(unittest.TestCase):
         make_epub(source, encrypted=True)
         with self.assertRaisesRegex(ValueError, "Encrypted EPUB contains unsupported"):
             EpubAdapter().import_file(source, "en", "zh-Hans")
+
+    def test_epub_attribute_order_and_fingerprints_are_stable_across_processes(self):
+        source = self.root / "input.epub"
+        make_epub(source)
+        original_bytes = source.read_bytes()
+        project = create_project(source, self.root / "projects")
+        project_source = project / "source" / source.name
+        child_script = """\
+import json
+import sys
+from pathlib import Path
+from private_translate.core.pipeline import assert_project_source_current
+from private_translate.core.state import write_json
+from private_translate.formats.epub import EpubAdapter
+
+mode, source, project = sys.argv[1:]
+project = Path(project)
+if mode == "check":
+    assert_project_source_current(project)
+    print(json.dumps({"source_current": True}))
+else:
+    document = EpubAdapter().import_file(Path(source), "en", "zh-Hans")
+    if mode == "save":
+        write_json(project / "work" / "document.json", document.to_dict())
+    print(json.dumps({
+        "attribute_order": [
+            [unit.locator["attribute"], unit.source_text]
+            for unit in document.units if unit.locator.get("kind") == "epub_attribute"
+        ],
+        "source_file_sha256": document.source_file_sha256,
+        "source_fingerprint": document.source_fingerprint,
+        "structure_fingerprint": document.structure_fingerprint,
+    }))
+"""
+
+        def run(seed, mode):
+            environment = os.environ.copy()
+            environment["PYTHONHASHSEED"] = seed
+            environment["PYTHONPATH"] = str(self.repo / "src") + (
+                os.pathsep + environment["PYTHONPATH"] if environment.get("PYTHONPATH") else ""
+            )
+            completed = subprocess.run(
+                [sys.executable, "-c", child_script, mode, str(project_source), str(project)],
+                check=True, capture_output=True, text=True, encoding="utf-8", env=environment,
+            )
+            return json.loads(completed.stdout)
+
+        seed_one = run("1", "inspect")
+        seed_two = run("2", "inspect")
+        self.assertEqual(seed_one["attribute_order"], [["alt", "A blue square"], ["title", "Blue square"]])
+        self.assertEqual(seed_one["attribute_order"], seed_two["attribute_order"])
+        for field in ("source_file_sha256", "source_fingerprint", "structure_fingerprint"):
+            self.assertEqual(seed_one[field], seed_two[field])
+
+        saved = run("1", "save")
+        self.assertEqual(saved["structure_fingerprint"], seed_one["structure_fingerprint"])
+        self.assertEqual(run("2", "check"), {"source_current": True})
+        self.assertEqual(source.read_bytes(), original_bytes)
+        self.assertEqual(project_source.read_bytes(), original_bytes)
 
     def test_font_obfuscation_is_preserved_without_decryption(self):
         source = self.root / "obfuscated-font.epub"

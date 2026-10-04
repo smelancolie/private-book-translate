@@ -23,7 +23,7 @@ FONT_OBFUSCATION = "http://www.idpf.org/2008/embedding"
 FONT_MEDIA_TYPES = {"font/ttf", "application/font-sfnt", "font/sfnt", "font/otf", "application/vnd.ms-opentype", "font/woff", "application/font-woff", "font/woff2"}
 BLOCKS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th", "caption", "figcaption", "dt", "dd", "title", "text"}
 HIDDEN = {"code", "pre", "script", "style", "svg", "math"}
-TRANSLATABLE_ATTRIBUTES = {"alt", "title", "aria-label"}
+TRANSLATABLE_ATTRIBUTES = ("alt", "title", "aria-label")
 MARKER = re.compile(r"⟦(/?)([PK])(\d+)⟧")
 
 

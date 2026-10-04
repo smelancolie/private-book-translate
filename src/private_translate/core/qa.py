@@ -7,11 +7,12 @@ import time
 import uuid
 from typing import Protocol
 
-from .batching import review_batches, translation_batches
+from .batching import ensure_task_budget, fit_task_batches, provider_budgets, review_batches, translation_batches
 from .execution import (
     PatchConflict,
     SCHEMAS,
     apply_translation_patch,
+    build_translation_task,
     create_review_task,
     create_translation_task,
     load_translation_task,
@@ -99,7 +100,7 @@ def _append_round(path: Path, rounds: list[dict], record: dict) -> dict:
 
 
 def _agent_review_evidence(project: Path, document: Document, candidate: dict,
-                           executor: ReviewExecutor, model: str) -> dict:
+                           executor: ReviewExecutor, model: str, budget: int) -> dict:
     task = candidate
     control = project / "qa" / "chapter-controls" / f"{task['chapter_id']}.json"
     rounds = read_json(control).get("rounds", []) if control.exists() else []
@@ -139,6 +140,7 @@ def _agent_review_evidence(project: Path, document: Document, candidate: dict,
         # Missing completed output is an error, never permission to redispatch.
         evidence = read_json(evidence_path)
     else:
+        ensure_task_budget(task, budget)
         evidence = executor.execute(task, model=model)
     try:
         validate_review_evidence_current(project, evidence, task)
@@ -232,8 +234,9 @@ def _agent_review_fixes(
 ) -> tuple[Document, int]:
     issue_ids = {issue["unit_id"] for issue in issues}
     selected = [unit for unit in document.units if unit.section_id == chapter_id and unit.id in issue_ids]
-    context = json.dumps({"purpose": "fix these independent review findings", "issues": issues}, ensure_ascii=False)
+    context = json.dumps({"purpose": "fix these independent review findings"}, ensure_ascii=False)
     applied = review_round["fixes_applied"]
+    budget = provider_budgets(capabilities, language)["translation_batch_target_tokens"]
     batches = []
     if resume_task_id is not None:
         completed_ids = set()
@@ -247,10 +250,22 @@ def _agent_review_fixes(
         batch = [unit for unit in selected if unit.id in pending_ids]
         selected = [unit for unit in selected if unit.id not in pending_ids]
         batches.append((batch, saved["context_capsule"]["batch"]))
-    for batch, batch_context, _ in translation_batches(selected, capabilities, language, context, glossary):
+    def fix_context(batch, batch_context):
         batch_ids = {unit.id for unit in batch}
-        batches.append((batch, {"review_issues": [issue for issue in issues if issue["unit_id"] in batch_ids],
-                               "translation_batch": json.loads(batch_context)}))
+        return {"review_issues": [issue for issue in issues if issue["unit_id"] in batch_ids],
+                "translation_batch": json.loads(batch_context)}
+
+    def pack(group):
+        return [(batch, batch_context) for batch, batch_context, _ in
+                translation_batches(group, capabilities, language, context, glossary)]
+
+    def draft(batch, batch_context):
+        return build_translation_task(project, document, chapter_id, owner_id,
+                                      unit_ids=[unit.id for unit in batch],
+                                      batch_context=fix_context(batch, batch_context))
+
+    batches.extend((batch, fix_context(batch, batch_context))
+                   for batch, batch_context in fit_task_batches(selected, budget, pack, draft))
     for batch, batch_context in batches:
         batch_ids = {unit.id for unit in batch}
         task_path = create_translation_task(
@@ -261,6 +276,7 @@ def _agent_review_fixes(
         )
         resume_task_id = None
         task = load_translation_task(project, task_path.stem)
+        ensure_task_budget(task, budget)
         if task["task_id"] not in review_round.setdefault("fix_task_ids", []):
             review_round["fix_task_ids"].append(task["task_id"])
         control = project / "qa" / "chapter-controls" / f"{chapter_id}.json"
@@ -302,6 +318,7 @@ def run_chapter_qa_agent(
     capabilities: ProviderCapabilities | None = None,
 ) -> Document:
     active_capabilities = capabilities if capabilities is not None else provider.capabilities
+    budget = provider_budgets(active_capabilities, language)["review_batch_target_tokens"]
     for section in document.sections:
         translated = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable]
         if not translated:
@@ -348,7 +365,25 @@ def run_chapter_qa_agent(
             translated = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable]
         for _ in range(REVIEWS_PER_INVOCATION):
             context = json.dumps({"section_title": section.title}, ensure_ascii=False)
-            batches = review_batches(translated, active_capabilities, language, context, language["review_rubric"])
+            def task_for_batch(batch, batch_context, index, count):
+                source_text = " ".join(unit.source_text.casefold() for unit in batch)
+                return create_review_task(
+                    document, section.section_id, reviewer_id, translation_owner_id,
+                    language["review_rubric"],
+                    context_capsule={
+                        "section_title": section.title,
+                        "batch_context": json.loads(batch_context),
+                        "glossary_slice": [term for term in glossary if term["source"].casefold() in source_text],
+                        "review_batch": {"index": index, "count": count, "unit_ids": [unit.id for unit in batch]},
+                    },
+                    unit_ids=[unit.id for unit in batch],
+                )
+
+            batches = fit_task_batches(
+                translated, budget,
+                lambda group: review_batches(group, active_capabilities, language, context, language["review_rubric"]),
+                lambda batch, batch_context: task_for_batch(batch, batch_context, len(translated) - 1, len(translated)),
+            )
             expected_ids = [unit.id for unit in translated]
             batch_ids = [unit.id for batch, _ in batches for unit in batch]
             if batch_ids != expected_ids:
@@ -356,19 +391,8 @@ def run_chapter_qa_agent(
             evidence_task_ids = []
             issues = []
             for index, (batch, batch_context) in enumerate(batches):
-                source_text = " ".join(unit.source_text.casefold() for unit in batch)
-                task = create_review_task(
-                    document, section.section_id, reviewer_id, translation_owner_id,
-                    language["review_rubric"],
-                    context_capsule={
-                        "section_title": section.title,
-                        "batch_context": json.loads(batch_context),
-                        "glossary_slice": [term for term in glossary if term["source"].casefold() in source_text],
-                        "review_batch": {"index": index, "count": len(batches), "unit_ids": [unit.id for unit in batch]},
-                    },
-                    unit_ids=[unit.id for unit in batch],
-                )
-                evidence = _agent_review_evidence(project, document, task, executor, review_model)
+                task = task_for_batch(batch, batch_context, index, len(batches))
+                evidence = _agent_review_evidence(project, document, task, executor, review_model, budget)
                 evidence_task_ids.append(evidence["task_id"])
                 issues.extend(evidence["issues"])
 
@@ -605,6 +629,9 @@ def run_book_consistency_agent(
     if reviewer_id == translation_owner_id:
         raise ValueError("Book consistency reviewer must differ from translation owner")
     report_path = project / "qa/book-consistency.json"
+    budgets = provider_budgets(capabilities, language)
+    review_budget = budgets["review_batch_target_tokens"]
+    fix_budget = budgets["translation_batch_target_tokens"]
     translated = [unit for unit in document.units if unit.translatable and unit.target_text is not None]
     target_hash = _target_hash(translated)
     glossary_hash = content_hash(json.dumps(glossary, ensure_ascii=False, sort_keys=True))
@@ -626,19 +653,26 @@ def run_book_consistency_agent(
                                   "candidate_section_ids": candidate["section_ids"],
                                   "candidate_unit_count": len(candidate["unit_ids"]),
                                   "occurrence_count": sum(item["count"] for item in candidate["source_occurrences"])}, ensure_ascii=False)
-            batches = review_batches(units, capabilities, language, context, language["consistency_rubric"])
-            for index, (batch, batch_context) in enumerate(batches):
-                task = {"schema_version": 1, "task_id": str(uuid.uuid4()), "task_type": "book_consistency",
+            def task_for_batch(batch, batch_context, index, count):
+                return {"schema_version": 1, "task_id": str(uuid.uuid4()), "task_type": "book_consistency",
                         "reviewer_id": reviewer_id, "translation_owner_id": translation_owner_id,
                         "target_hash": target_hash, "glossary_hash": glossary_hash,
                         "source_units": [{"unit_id": unit.id, "section_id": unit.section_id,
                                           "source_hash": unit.source_hash, "source_text": unit.source_text} for unit in batch],
                         "target_units": [{"unit_id": unit.id, "target_text": unit.target_text} for unit in batch],
                         "context_capsule": {"batch": json.loads(batch_context), "batch_index": index,
-                                            "batch_count": len(batches), "candidate_unit_count": len(candidate["unit_ids"]),
+                                            "batch_count": count, "candidate_unit_count": len(candidate["unit_ids"]),
                                             "candidate_section_ids": candidate["section_ids"]},
                         "rubric": language["consistency_rubric"],
                         "required_result_schema": BOOK_CONSISTENCY_RESULT_SCHEMA}
+
+            batches = fit_task_batches(
+                units, review_budget,
+                lambda group: review_batches(group, capabilities, language, context, language["consistency_rubric"]),
+                lambda batch, batch_context: task_for_batch(batch, batch_context, len(units) - 1, len(units)),
+            )
+            for index, (batch, batch_context) in enumerate(batches):
+                task = task_for_batch(batch, batch_context, index, len(batches))
                 write_json(project / "work/tasks/consistency" / f"{task['task_id']}.json", task)
                 active["task_ids"].append(task["task_id"])
         report.update(status="REVIEWING", target_hash=target_hash, glossary_hash=glossary_hash,
@@ -653,6 +687,8 @@ def run_book_consistency_agent(
         for task_id in active["task_ids"]:
             task = read_json(project / "work/tasks/consistency" / f"{task_id}.json")
             evidence_path = project / "qa/consistency/evidence" / f"{task_id}.json"
+            if not evidence_path.exists():
+                ensure_task_budget(task, review_budget)
             result = read_json(evidence_path) if evidence_path.exists() else executor.execute(task, model=review_model)
             validate_book_consistency_result(project, result, task)
             if not evidence_path.exists():
@@ -670,9 +706,23 @@ def run_book_consistency_agent(
         selected_ids = {issue["unit_id"] for issue in issues}
         for section in document.sections:
             units = [unit for unit in translated if unit.section_id == section.section_id and unit.id in selected_ids]
-            for batch, batch_context, _ in translation_batches(
-                units, capabilities, language, json.dumps({"purpose": "fix book consistency findings", "issues": issues}, ensure_ascii=False), glossary,
-            ):
+            context = json.dumps({"purpose": "fix book consistency findings"}, ensure_ascii=False)
+            def fix_context(batch, batch_context):
+                batch_ids = {unit.id for unit in batch}
+                return {"consistency_issues": [issue for issue in issues if issue["unit_id"] in batch_ids],
+                        "consistency_round": active["round"], "translation_batch": json.loads(batch_context),
+                        "book_target_hash": target_hash, "glossary_hash": glossary_hash}
+
+            batches = fit_task_batches(
+                units, fix_budget,
+                lambda group: [(batch, batch_context) for batch, batch_context, _ in
+                               translation_batches(group, capabilities, language, context, glossary)],
+                lambda batch, batch_context: build_translation_task(
+                    project, document, section.section_id, translation_owner_id,
+                    unit_ids=[unit.id for unit in batch], batch_context=fix_context(batch, batch_context),
+                ),
+            )
+            for batch, batch_context in batches:
                 active["fix_batches"].append({"chapter_id": section.section_id,
                                               "unit_ids": [unit.id for unit in batch],
                                               "translation_batch": json.loads(batch_context)})
@@ -695,6 +745,7 @@ def run_book_consistency_agent(
         archive = project / "work/patches/translation" / f"{task['task_id']}.json"
         if not archive.exists():
             validate_book_consistency_fix_current(project, task)
+            ensure_task_budget(task, fix_budget)
             patch = translation_executor.execute(task, model=translation_model)
             before = {unit.id: unit.target_text for unit in document.units if unit.id in batch["unit_ids"]}
             document = apply_translation_patch(project, patch)
