@@ -185,7 +185,7 @@ class AgentBackendTests(unittest.TestCase):
 
         interrupted = InterruptAfterFirstBatch()
         with self.assertRaisesRegex(RuntimeError, "simulated worker interruption"):
-            _translate_agent(document, project, FakeProvider(), self.language, [], interrupted, DEFAULT_AGENT_MODEL)
+            _translate_agent(document, project, FakeProvider().capabilities, self.language, [], interrupted, DEFAULT_AGENT_MODEL)
         accepted_chapter = document.sections[0].section_id
         accepted_files = list((project / "work" / "patches" / "translation").glob("*.json"))
         self.assertEqual(len(accepted_files), 1)
@@ -205,7 +205,7 @@ class AgentBackendTests(unittest.TestCase):
         document_path = project / "work" / "document.json"
         original = document_path.read_bytes()
         with self.assertRaisesRegex(ValueError, "Missing required units"):
-            _translate_agent(document, project, FakeProvider(), self.language, [], FakeAgentExecutor(partial=True), DEFAULT_AGENT_MODEL)
+            _translate_agent(document, project, FakeProvider().capabilities, self.language, [], FakeAgentExecutor(partial=True), DEFAULT_AGENT_MODEL)
         self.assertEqual(document_path.read_bytes(), original)
 
     def test_stale_agent_patch_regenerates_task_from_current_canonical_state(self):
@@ -219,7 +219,7 @@ class AgentBackendTests(unittest.TestCase):
             write_json(path, current.to_dict())
 
         executor = FakeAgentExecutor(project, on_first=concurrent_change)
-        merged = _translate_agent(document, project, FakeProvider(), self.language, [], executor, DEFAULT_AGENT_MODEL)
+        merged = _translate_agent(document, project, FakeProvider().capabilities, self.language, [], executor, DEFAULT_AGENT_MODEL)
         self.assertEqual(len(executor.tasks), 2)
         self.assertNotEqual(executor.tasks[0]["task_id"], executor.tasks[1]["task_id"])
         self.assertNotEqual(executor.tasks[0]["base_chapter_digest"], executor.tasks[1]["base_chapter_digest"])
@@ -228,7 +228,7 @@ class AgentBackendTests(unittest.TestCase):
     def test_agent_executor_receives_task_without_workspace_handle(self):
         project, document = self.project("# First\n\nThe river runs west.\n")
         executor = FakeAgentExecutor()
-        _translate_agent(document, project, FakeProvider(), self.language, [], executor, DEFAULT_AGENT_MODEL)
+        _translate_agent(document, project, FakeProvider().capabilities, self.language, [], executor, DEFAULT_AGENT_MODEL)
         task = executor.tasks[0]
         self.assertNotIn("project_path", task)
         self.assertNotIn("document_path", task)

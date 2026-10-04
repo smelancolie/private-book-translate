@@ -19,10 +19,9 @@ def estimate_tokens(value: str) -> int:
     return math.ceil(len(value.encode("utf-8")) / 3)
 
 
-def provider_budgets(provider, language: dict[str, object]) -> dict[str, int]:
-    capabilities = provider.capabilities
+def provider_budgets(capabilities: ProviderCapabilities, language: dict[str, object]) -> dict[str, int]:
     if not isinstance(capabilities, ProviderCapabilities):
-        raise TypeError("Providers must expose verified ProviderCapabilities")
+        raise TypeError("Expected ProviderCapabilities")
     configured = language["provider_limits"]
     max_output = min(int(configured["max_output_tokens"]), capabilities.max_output_tokens)
     max_input = min(int(configured["max_input_tokens"]), capabilities.max_context_tokens - max_output)
@@ -101,8 +100,8 @@ def split_oversized_units(document: Document, max_tokens: int) -> None:
     document.units = units
 
 
-def maximum_unit_tokens(provider, language: dict[str, object]) -> int:
-    budgets = provider_budgets(provider, language)
+def maximum_unit_tokens(capabilities: ProviderCapabilities, language: dict[str, object]) -> int:
+    budgets = provider_budgets(capabilities, language)
     return max(1, min(
         budgets["max_input_tokens"], budgets["translation_batch_target_tokens"],
         budgets["review_batch_target_tokens"], budgets["max_output_tokens"],
@@ -125,8 +124,8 @@ def _neighbor_context(units: list[TranslationUnit], start: int, end: int, base_c
     return json.dumps({"section_context": base_context, "neighbors": neighbors}, ensure_ascii=False)
 
 
-def translation_batches(units: list[TranslationUnit], provider, language: dict[str, object], context: str, glossary: list[dict[str, str]]):
-    max_tokens = provider_budgets(provider, language)["translation_batch_target_tokens"]
+def translation_batches(units: list[TranslationUnit], capabilities: ProviderCapabilities, language: dict[str, object], context: str, glossary: list[dict[str, str]]):
+    max_tokens = provider_budgets(capabilities, language)["translation_batch_target_tokens"]
     system_cost = estimate_tokens(language["translation_prompt"]) + _REQUEST_OVERHEAD_TOKENS
     result = []
     start = 0
@@ -168,8 +167,8 @@ def translation_batches(units: list[TranslationUnit], provider, language: dict[s
     return result
 
 
-def review_batches(units: list[TranslationUnit], provider, language: dict[str, object], context: str, rubric: str):
-    max_tokens = provider_budgets(provider, language)["review_batch_target_tokens"]
+def review_batches(units: list[TranslationUnit], capabilities: ProviderCapabilities, language: dict[str, object], context: str, rubric: str):
+    max_tokens = provider_budgets(capabilities, language)["review_batch_target_tokens"]
     system_cost = estimate_tokens(rubric) + _REQUEST_OVERHEAD_TOKENS
     result = []
     start = 0

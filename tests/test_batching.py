@@ -46,10 +46,10 @@ class BatchingTests(unittest.TestCase):
         )
 
     def test_provider_capabilities_bound_configured_budgets(self):
-        provider = RecordingProvider()
+        capabilities = ProviderCapabilities("fake", "small-context", 1200, 100, True, False)
         language = load_language_package("en", "zh-Hans")
 
-        budgets = provider_budgets(provider, language)
+        budgets = provider_budgets(capabilities, language)
 
         self.assertEqual(budgets["max_output_tokens"], 100)
         self.assertEqual(budgets["max_input_tokens"], 1100)
@@ -84,9 +84,9 @@ class BatchingTests(unittest.TestCase):
 
     def test_batch_never_splits_an_ordinary_unit(self):
         units = [self.unit(f"Unit {index} has a complete sentence.", [index]) for index in range(4)]
-        provider = RecordingProvider()
+        capabilities = ProviderCapabilities("fake", "small-context", 1200, 100, True, False)
         language = load_language_package("en", "zh-Hans")
-        batches = translation_batches(units, provider, language, "", [])
+        batches = translation_batches(units, capabilities, language, "", [])
 
         self.assertEqual([unit.id for batch, _, _ in batches for unit in batch], [unit.id for unit in units])
         self.assertTrue(all(unit.source_text.endswith("sentence.") for batch, _, _ in batches for unit in batch))

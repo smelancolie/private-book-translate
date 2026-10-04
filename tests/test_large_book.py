@@ -113,7 +113,7 @@ class LargeBookTests(unittest.TestCase):
             north_star = next(term for term in occurrences if term["term"] == "North Star")
             self.assertEqual(len(north_star["unit_ids"]), chapters * paragraphs + 1)
             language = load_language_package("en", "zh-Hans")
-            budgets = provider_budgets(provider, language)
+            budgets = provider_budgets(provider.capabilities, language)
             total_units = len(document.units)
             total_source_chars = len(source_in_project.read_text(encoding="utf-8"))
             self.assertTrue(all(request["tokens"] <= budgets["translation_batch_target_tokens"] for request in provider.translation_requests))
@@ -196,7 +196,7 @@ class LargeBookTests(unittest.TestCase):
             self.assertGreater(document_path.stat().st_size, 0)
 
             language = load_language_package("en", "zh-Hans")
-            budgets = provider_budgets(provider, language)
+            budgets = provider_budgets(provider.capabilities, language)
             self.assertTrue(provider.translation_requests)
             self.assertTrue(provider.review_requests)
             self.assertTrue(all(request["tokens"] <= budgets["translation_batch_target_tokens"] for request in provider.translation_requests))

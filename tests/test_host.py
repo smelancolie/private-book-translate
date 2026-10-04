@@ -21,7 +21,7 @@ class HostTests(unittest.TestCase):
     project = fixtures.AgentReviewTests.project
 
     def advance(self, project):
-        return advance_host_run(project, provider=self.provider,
+        return advance_host_run(project, capabilities=self.provider.capabilities,
                                 agent_model="host-translation", review_model="host-review")
 
     def setUp(self):
@@ -31,12 +31,22 @@ class HostTests(unittest.TestCase):
         self.reviewer = fixtures.FakeReviewExecutor()
 
     def result(self, item):
+        if item["task"]["task_type"] == "terminology":
+            task = item["task"]
+            return {"schema_version": 1, "task_id": task["task_id"], "owner_id": task["owner_id"],
+                    "proposals": [{"source": source, "preferred_translation": "术语" + source}
+                                  for source in task["source_keys"]]}
+        if item["task"]["task_type"] == "book_consistency":
+            task = item["task"]
+            return {"schema_version": 1, "task_id": task["task_id"], "reviewer_id": task["reviewer_id"],
+                    "target_hash": task["target_hash"], "glossary_hash": task["glossary_hash"],
+                    "issues": [], "summary": "Reviewed cross-chapter consistency."}
         executor = self.translator if item["task"]["task_type"] == "translation" else self.reviewer
         return executor.execute(item["task"], model=item["model"])
 
     def run_to_candidates(self, project):
         request = self.advance(project)
-        while request["status"] == "awaiting_host":
+        while request["status"] in {"awaiting_host", "terminology_ready"}:
             for item in request["tasks"]:
                 submit_host_result(project, self.result(item))
             request = self.advance(project)

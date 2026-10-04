@@ -2,7 +2,7 @@
 
 本地文件优先的 EPUB / Markdown 翻译项目，正式执行入口为 **Codex / host integration → Python core**，第一版语言对为 English → 简体中文（`en` → `zh-Hans`）。源文件、翻译状态、术语表、QA 记录和输出都保存在独立的 `projects/<id>/` 工作区；每个项目自带 Git 忽略规则，在 Git 仓库内初始化时还会确认私有状态确实被忽略。
 
-翻译与章节复核由宿主 Agent 执行，术语提案及全书一致性仍调用用户配置的 provider。core 的网络调用只通过 provider adapter；内置适配器兼容 OpenAI Chat Completions API。项目不是纯离线工具，API 密钥只从 `OPENAI_API_KEY` 环境变量读取，不写入项目。
+正式宿主流程中的术语提案、翻译、章节复核、全书一致性及修复均由 Codex Agent 执行。Python core 不构造或调用 HTTP provider，不需要配置独立的 provider API 密钥；模型请求由宿主接管。内部 API 执行路径继续使用既有 provider adapter，其密钥只从环境变量读取，不写入项目。
 
 ## 安装与运行
 
@@ -21,29 +21,28 @@ python -m pip install -e .
 仓库的 `AGENTS.md` 已包含 Codex 调度步骤：用真实的 `spawn_agent` / `followup_task` worker 执行返回任务，并将逻辑身份绑定到实际 worker。现有 `gpt-6-luna-max` 选择对应 `luna_worker` 的 `gpt-6-luna` + `max`；传入 host API 的模型值为实际模型名。
 
 ```python
-import os
 from pathlib import Path
 
 from private_translate.core.project import create_project
 from private_translate.core.pipeline import build_project, validate_project
-from private_translate.core.providers import OpenAICompatibleProvider
+from private_translate.core.providers import ProviderCapabilities
 from private_translate.host import (
     advance_host_run, get_host_request, get_project_status, submit_host_result,
     start_host_spotcheck, finish_host_spotcheck,
 )
 
-provider = OpenAICompatibleProvider(
-    os.environ.get("PRIVATE_TRANSLATE_BASE_URL", "https://api.openai.com/v1"),
-    os.environ["PRIVATE_TRANSLATE_MODEL"],
-)
+capabilities = ProviderCapabilities("codex-host", "gpt-6-luna",
+    max_context_tokens=8000, max_output_tokens=2000,
+    supports_json_mode=True, supports_parallel_requests=True)
+# 这里声明本次任务预算；根据实际宿主能力调整。
 project = create_project(Path("projects/inputs/book.epub"), Path("projects"))
 status = get_project_status(project)
-request = advance_host_run(project, provider=provider, bilingual=True,
+request = advance_host_run(project, capabilities=capabilities, bilingual=True,
                            agent_model="gpt-6-luna", review_model="gpt-6-luna")
 # Python 调用在此结束；Codex 在调用之外调度 request 中的真实 worker。
 ```
 
-`request["status"] == "awaiting_host"` 时，宿主读取 `tasks` 中的 `task`、`model` 和 `worker_id`，用真实的宿主 Agent 执行：翻译任务返回 TranslationPatch，章节复核返回 ReviewEvidence。随后调用 `submit_host_result(project, result)` 存储经过 core 校验的结果，再调用 `advance_host_run`。返回 `spotcheck_pending` 时，候选输出已经构建，仍需要现有两轮抽检。
+`request["status"] == "awaiting_host"` 时，宿主读取 `tasks` 中的 `task`、`model` 和 `worker_id`，用真实的宿主 Agent 执行：术语任务按 `required_result_schema` 返回提案，翻译任务返回 TranslationPatch，章节复核返回 ReviewEvidence，全书一致性任务返回指定 schema 的问题证据。随后调用 `submit_host_result(project, result)` 存储经过 core 校验的结果，再调用 `advance_host_run`。返回 `spotcheck_pending` 时，候选输出已经构建，仍需要现有两轮抽检。
 
 `start_host_spotcheck(project, seed=17, reviewer_a_id=worker_a_id, reviewer_b_id=worker_b_id, model=host_spotcheck_model)` 返回两个 SpotcheckTask。审阅者 ID 应绑定两个真实、独立的宿主 worker；宿主按任务指定的模型执行，并分别提交 SpotcheckEvidence。`finish_host_spotcheck` 在两份结果齐全后执行已有证据接收与评分流程。使用不同 seed 完成第二轮后，调用 `build_project` 和 `validate_project`。
 
@@ -51,7 +50,9 @@ request = advance_host_run(project, provider=provider, bilingual=True,
 
 任务交接保存在 `work/host/request.json`，宿主结果保存在 `work/host/results/<task_id>.json`，都位于被忽略的项目目录。Python 进程退出后用 `get_host_request` 恢复待执行任务；已提交结果显示为 `results_ready`。相同结果重复提交只确认存储，不重复修改译文；不同结果不能覆盖已有结果。真正合并 patch、记录章节 QA 和抽检完成状态的是后续的 advance/finish 操作。
 
-一次待完成运行保持相同的 provider、模型和复核身份配置，同一项目的 core 写入操作由宿主顺序调度。提交前若来源变化，core 明确拒绝；正常翻译与复核修复恢复沿用原 TranslationTask ID。该入口固定使用 Agent 翻译和章节复核；术语提案及全书一致性仍调用配置 provider。宿主实现负责实际模型调用，Python 不新建模型客户端或在后台等待。
+一次待完成运行保持相同的能力预算、模型和复核身份配置，同一项目的 core 写入操作由宿主顺序调度。提交前若来源变化，core 明确拒绝；正常翻译与复核修复恢复沿用原 TranslationTask ID。术语候选行在等待期间被人工修改，或全书一致性任务的译文/批准术语变化时，旧任务结果明确拒绝。宿主负责实际模型调用，Python 不新建模型客户端或在后台等待。
+
+术语提案最后一批被 core 接收后，返回 `terminology_ready`，尚未创建正文翻译任务。宿主可让用户检查并批准候选词，然后再推进；未批准的提案仍不会锁入翻译。术语任务使用 `agent:terminology-owner`，可绑定现有译者 worker；一致性审阅者与译者保持独立。全书审阅按术语收集跨章节出现记录并分批，所有任务证据完整后才判定通过；发现问题交回原译者修复，经完整章节复核和新一轮全书审阅后再构建候选。
 
 `create_project` 也支持 `.md`。默认只产出目标语；`advance_host_run(..., bilingual=True)` 会同时产出目标语版和双语版，并将这个选择保存在项目中。输出名稳定为：
 
@@ -62,7 +63,7 @@ book.zh-Hans.md
 book.en-zh-Hans.bilingual.md
 ```
 
-`advance_host_run` 可重复执行；未变化且已完成的单元会跳过。provider 暂时失败时，已保存的章节状态保留。章节修订后会进行新一轮完整章节复核，并让全书一致性与最终译文修订匹配。
+`advance_host_run` 可重复执行；未变化且已完成的单元会跳过。宿主任务暂时未完成时，已保存的任务和章节状态保留。章节修订后会进行新一轮完整章节复核，并让全书一致性与最终译文修订匹配。
 
 ## 抽检与最终验证
 
@@ -99,6 +100,6 @@ projects/<id>/
 └── output/       # 目标语与可选双语候选/最终产物
 ```
 
-首次推进会在翻译前发现重复专名和术语，并通过配置的 provider 生成 `glossary/candidates.csv` 提案。人工将条目的 `status` 改为 `approved` 后，下次运行会把它锁入 `terms.csv`；只有 `approved` 项进入强制术语表。`proposed` 与 `rejected` 项不会影响翻译。OpenAI-compatible provider 默认按 8k context / 2k output 的保守能力分批，可用 `PRIVATE_TRANSLATE_MAX_CONTEXT_TOKENS` 和 `PRIVATE_TRANSLATE_MAX_OUTPUT_TOKENS` 声明当前 endpoint 的能力。
+首次推进会在翻译前本地发现重复专名和术语，并通过宿主 Agent 生成 `glossary/candidates.csv` 提案。人工将条目的 `status` 改为 `approved` 后，下次运行会把它锁入 `terms.csv`；只有 `approved` 项进入强制术语表。`proposed` 与 `rejected` 项不会影响翻译。正式宿主分批使用显式传入的 `ProviderCapabilities` 和现有语言包预算，不依赖 HTTP provider 客户端。
 
 第一版限制：只提供 `en` → `zh-Hans`；不做 OCR；不翻译图片像素、代码、公式语法、URL、CSS 或 JavaScript。支持 EPUB 3 导航与 EPUB 2 NCX；无法读取的加密 EPUB / DRM 会明确拒绝；符合 EPUB 规范的字体混淆项只原样保留，不解密。EPUB XHTML 以原 DOM 为基础改写翻译文本，并保留原 CSS 与其他 ZIP 资源；双语版按块插入目标语。Markdown 依赖 Pandoc AST 并启用 Markdown header attributes，以保留显式标题锚点。当前机器未检测到 `epubcheck` 可执行文件，因此只可报告内置结构验证结果，不能声称 EPUBCheck 已通过。

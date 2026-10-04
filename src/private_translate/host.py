@@ -7,6 +7,12 @@ from pathlib import Path
 import uuid
 
 from .core.execution import validate_translation_patch, validate_review_evidence_current
+from .core.glossary import validate_terminology_result, validate_terminology_task_current
+from .core.providers import ProviderCapabilities
+from .core.qa import (
+    validate_book_consistency_result, validate_book_consistency_task_current,
+    validate_book_consistency_fix_current,
+)
 from .core.pipeline import (
     DEFAULT_AGENT_MODEL, DEFAULT_AGENT_REVIEW_MODEL, _load_project,
     _write_run_state, assert_project_source_current, run_project,
@@ -56,6 +62,15 @@ def _request_path(project: Path) -> Path:
 def _dispatch(task: dict, model: str) -> dict:
     return {"task": task, "model": model,
             "worker_id": task.get("owner_id") or task["reviewer_id"]}
+
+
+def _validate_auxiliary_task_current(project: Path, task: dict) -> None:
+    if task["task_type"] == "terminology":
+        validate_terminology_task_current(project, task)
+    elif task["task_type"] == "book_consistency":
+        validate_book_consistency_task_current(project, task)
+    elif task["task_type"] == "translation" and (task["context_capsule"].get("batch") or {}).get("consistency_issues"):
+        validate_book_consistency_fix_current(project, task)
 
 
 def get_host_request(project: Path) -> dict:
@@ -110,57 +125,68 @@ def submit_host_result(project: Path, result: dict) -> dict:
         raise ValueError("Host result does not belong to the pending request")
     assert_project_source_current(project)
     task = item["task"]
+    _validate_auxiliary_task_current(project, task)
     if task["task_type"] == "translation":
         validate_translation_patch(project, result)
     elif task["task_type"] == "chapter_review":
         validate_review_evidence_current(project, result, task)
-    else:
+    elif task["task_type"] == "terminology":
+        validate_terminology_result(project, result, task)
+    elif task["task_type"] == "book_consistency":
+        validate_book_consistency_result(project, result, task)
+    elif task["task_type"] == "spotcheck":
         _, _, document = _load_project(project)
         validate_spotcheck_evidence_current(project, document, project / request["directory"], task, result)
+    else:
+        raise ValueError("Unknown host task type")
     write_json(response, result)
     return {"status": "result_stored", "task_id": task["task_id"]}
 
 
 def advance_host_run(
-    project: Path, *, provider=None, base_url: str | None = None, model: str | None = None,
+    project: Path, *, capabilities: ProviderCapabilities,
     bilingual: bool = False, agent_model: str = DEFAULT_AGENT_MODEL,
     review_model: str = DEFAULT_AGENT_REVIEW_MODEL, reviewer_id: str = "host:chapter-reviewer",
 ) -> dict:
     """Run until the next Agent task or candidate output, then return immediately.
 
-    Use the same provider/model settings throughout one pending run. Provider
-    terminology and book-consistency calls remain synchronous, as in the core.
+    Use the same capabilities/model settings throughout one pending run. All
+    model tasks, including terminology and consistency, execute in the host.
     """
     project = project.resolve(strict=True)
     pending = get_host_request(project)
     resume_translation = resume_fix = None
+    stop_after_terminology = False
     if pending["status"] in {"awaiting_host", "results_ready"}:
         if pending["operation"] != "run":
             raise ValueError("Finish the pending host spotcheck before running the project")
         assert_project_source_current(project)
+        task = read_json(_request_path(project))["tasks"][0]["task"]
+        _validate_auxiliary_task_current(project, task)
         if pending["status"] == "awaiting_host":
             return pending
-        task = read_json(_request_path(project))["tasks"][0]["task"]
+        stop_after_terminology = task["task_type"] == "terminology"
         if task["task_type"] == "translation":
             if (task["context_capsule"].get("batch") or {}).get("review_issues"):
                 resume_fix = task["task_id"]
-            else:
+            elif not (task["context_capsule"].get("batch") or {}).get("consistency_issues"):
                 resume_translation = task["task_id"]
     executor = FileHostExecutor(project)
     try:
         outputs = run_project(
-            project, provider=provider, base_url=base_url, model=model, bilingual=bilingual,
+            project, capabilities=capabilities, auxiliary_executor=executor, bilingual=bilingual,
             translation_backend=1, agent_executor=executor, agent_model=agent_model,
             review_backend=1, review_executor=executor, reviewer_id=reviewer_id,
             review_model=review_model, resume_translation_task_id=resume_translation,
             resume_fix_task_id=resume_fix,
+            stop_after_terminology=stop_after_terminology,
         )
     except HostTaskPending as pending_task:
         request = {"status": "awaiting_host", "operation": "run",
                    "tasks": [_dispatch(pending_task.task, pending_task.model)]}
         _write_run_state(project, "awaiting_host", host_task_id=pending_task.task["task_id"])
     else:
-        request = {"status": "spotcheck_pending", "operation": "run", "tasks": [],
+        request = {"status": "terminology_ready" if stop_after_terminology else "spotcheck_pending", "operation": "run", "tasks": [],
                    "outputs": [str(path) for path in outputs]}
     write_json(_request_path(project), request)
     return request

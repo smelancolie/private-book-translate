@@ -14,8 +14,11 @@ from .glossary import load_glossary, prepare_terminology
 from .language import load_language_package
 from .model import Document
 from .batching import maximum_unit_tokens, split_oversized_units, translation_batches
-from .providers import OpenAICompatibleProvider, TranslationProvider
-from .qa import _target_hash, run_book_consistency, run_chapter_qa, run_chapter_qa_agent, validate_qa
+from .providers import OpenAICompatibleProvider, ProviderCapabilities, TranslationProvider
+from .qa import (
+    _target_hash, run_book_consistency, run_book_consistency_agent,
+    run_chapter_qa, run_chapter_qa_agent, validate_qa,
+)
 from .spotcheck import validate_spotcheck
 from .execution import (
     PatchConflict,
@@ -72,7 +75,7 @@ def _translate(document: Document, project: Path, provider: TranslationProvider,
     for section, units in _pending_by_section(document):
         context = json.dumps({"section": section.title}, ensure_ascii=False)
         try:
-            for batch, batch_context, batch_glossary in translation_batches(units, provider, language, context, glossary):
+            for batch, batch_context, batch_glossary in translation_batches(units, provider.capabilities, language, context, glossary):
                 translations = provider.translate(batch, batch_context, batch_glossary, language)
                 if set(translations) != {unit.id for unit in batch}:
                     raise ValueError("Provider response must contain exactly one translation per requested unit")
@@ -92,7 +95,7 @@ def _translate(document: Document, project: Path, provider: TranslationProvider,
 
 
 def _translate_agent(
-    document: Document, project: Path, provider: TranslationProvider,
+    document: Document, project: Path, capabilities: ProviderCapabilities,
     language: dict, glossary: list[dict[str, str]], executor: AgentExecutor,
     model: str,
     resume_task_id: str | None = None,
@@ -106,9 +109,9 @@ def _translate_agent(
             batch = [unit for unit in units if unit.id in selected]
             remaining = [unit for unit in units if unit.id not in selected]
             batches = [(batch, json.dumps(saved["context_capsule"]["batch"], ensure_ascii=False), [])]
-            batches.extend(translation_batches(remaining, provider, language, context, glossary))
+            batches.extend(translation_batches(remaining, capabilities, language, context, glossary))
         else:
-            batches = translation_batches(units, provider, language, context, glossary)
+            batches = translation_batches(units, capabilities, language, context, glossary)
         for batch, batch_context, _ in batches:
             task_path = create_translation_task(
                 project, section.section_id, owner_id,
@@ -232,6 +235,8 @@ def run_project(
     review_executor: AgentExecutor | None = None, reviewer_id: str = "agent:chapter-reviewer",
     review_model: str = DEFAULT_AGENT_REVIEW_MODEL, allow_review_fallback: bool = False,
     resume_translation_task_id: str | None = None, resume_fix_task_id: str | None = None,
+    auxiliary_executor: AgentExecutor | None = None, capabilities: ProviderCapabilities | None = None,
+    stop_after_terminology: bool = False,
 ) -> list[Path]:
     backend = select_translation_backend(translation_backend)
     if backend == "agent" and agent_executor is None:
@@ -260,23 +265,38 @@ def run_project(
         manifest["bilingual"] = True
         write_json(project / "project.json", manifest)
     language = load_language_package(manifest["source_language"], manifest["target_language"])
-    active_provider = provider or _provider(base_url, model, language)
+    active_provider = None if auxiliary_executor is not None else (provider or _provider(base_url, model, language))
+    active_capabilities = capabilities if auxiliary_executor is not None else active_provider.capabilities
     source_path = project / manifest["source_file"]
     fresh = _adapter(manifest["format"]).import_file(source_path, manifest["source_language"], manifest["target_language"])
-    split_oversized_units(fresh, maximum_unit_tokens(active_provider, language))
+    split_oversized_units(fresh, maximum_unit_tokens(active_capabilities, language))
     if saved is not None:
         fresh = merge_saved_state(fresh, saved)
     write_json(project / "work" / "document.json", fresh.to_dict())
-    prepare_terminology(project, fresh, active_provider, language)
+    prepare_terminology(project, fresh, active_provider, language,
+                        executor=auxiliary_executor, model=agent_model, capabilities=active_capabilities)
+    if stop_after_terminology:
+        _write_run_state(project, "terminology_ready")
+        return []
     glossary = load_glossary(project / "glossary" / "terms.csv")
     if backend == "agent":
-        fresh = _translate_agent(fresh, project, active_provider, language, glossary, agent_executor, agent_model,
+        fresh = _translate_agent(fresh, project, active_capabilities, language, glossary, agent_executor, agent_model,
                                  resume_task_id=resume_translation_task_id)
     else:
         _translate(fresh, project, active_provider, language, glossary)
     if selected_review_backend == "agent":
+        consistency_path = project / "qa" / "book-consistency.json"
+        if auxiliary_executor is not None and consistency_path.exists():
+            active_round = read_json(consistency_path).get("active_round")
+            if active_round is not None and active_round["phase"] == "fix":
+                fresh = run_book_consistency_agent(
+                    project, fresh, active_capabilities, language, glossary, auxiliary_executor,
+                    reviewer_id=reviewer_id, translation_owner_id=translation_owner_id,
+                    review_model=review_model, translation_executor=agent_executor, translation_model=agent_model,
+                )
         for _ in range(3):
-            run_book_consistency(project, fresh, active_provider, language, glossary)
+            if auxiliary_executor is None:
+                run_book_consistency(project, fresh, active_provider, language, glossary)
             fresh = run_chapter_qa_agent(
                 project, fresh, active_provider, language, glossary, review_executor,
                 reviewer_id=reviewer_id, translation_owner_id=translation_owner_id,
@@ -284,8 +304,15 @@ def run_project(
                 translation_executor=agent_executor if backend == "agent" else None,
                 translation_model=agent_model,
                 resume_fix_task_id=resume_fix_task_id,
+                capabilities=active_capabilities,
             )
             resume_fix_task_id = None
+            if auxiliary_executor is not None:
+                fresh = run_book_consistency_agent(
+                    project, fresh, active_capabilities, language, glossary, auxiliary_executor,
+                    reviewer_id=reviewer_id, translation_owner_id=translation_owner_id,
+                    review_model=review_model, translation_executor=agent_executor, translation_model=agent_model,
+                )
             report = read_json(project / "qa" / "book-consistency.json")
             if report.get("status") == "PASS" and report.get("target_hash") == _target_hash(
                 [unit for unit in fresh.units if unit.translatable and unit.target_text is not None]
