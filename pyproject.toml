@@ -9,8 +9,5 @@ description = "Local-first EPUB and Markdown translation workspaces"
 requires-python = ">=3.11"
 dependencies = ["lxml>=5"]
 
-[project.scripts]
-translate = "private_translate.cli:main"
-
 [tool.setuptools.package-data]
 private_translate = ["languages/**/*.json", "languages/**/*.md"]

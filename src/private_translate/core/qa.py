@@ -226,21 +226,41 @@ def _agent_review_fixes(
     project: Path, document: Document, chapter_id: str, issues: list[dict],
     provider: TranslationProvider, language: dict, glossary: list[dict[str, str]],
     executor: ReviewExecutor, owner_id: str, model: str, review_round: dict, rounds: list[dict],
+    resume_task_id: str | None = None,
 ) -> tuple[Document, int]:
     issue_ids = {issue["unit_id"] for issue in issues}
     selected = [unit for unit in document.units if unit.section_id == chapter_id and unit.id in issue_ids]
     context = json.dumps({"purpose": "fix these independent review findings", "issues": issues}, ensure_ascii=False)
-    applied = 0
+    applied = review_round["fixes_applied"]
+    batches = []
+    if resume_task_id is not None:
+        completed_ids = set()
+        for task_id in review_round["fix_task_ids"]:
+            patch_path = project / "work" / "patches" / "translation" / f"{task_id}.json"
+            if patch_path.exists():
+                completed_ids.update(row["unit_id"] for row in read_json(patch_path)["patch"]["translations"])
+        selected = [unit for unit in selected if unit.id not in completed_ids]
+        saved = load_translation_task(project, resume_task_id)
+        pending_ids = set(saved["unit_ids"])
+        batch = [unit for unit in selected if unit.id in pending_ids]
+        selected = [unit for unit in selected if unit.id not in pending_ids]
+        batches.append((batch, saved["context_capsule"]["batch"]))
     for batch, batch_context, _ in translation_batches(selected, provider, language, context, glossary):
+        batch_ids = {unit.id for unit in batch}
+        batches.append((batch, {"review_issues": [issue for issue in issues if issue["unit_id"] in batch_ids],
+                               "translation_batch": json.loads(batch_context)}))
+    for batch, batch_context in batches:
         batch_ids = {unit.id for unit in batch}
         task_path = create_translation_task(
             project, chapter_id, owner_id,
             unit_ids=[unit.id for unit in batch],
-            batch_context={"review_issues": [issue for issue in issues if issue["unit_id"] in batch_ids],
-                           "translation_batch": json.loads(batch_context)},
+            batch_context=batch_context,
+            resume_task_id=resume_task_id,
         )
+        resume_task_id = None
         task = load_translation_task(project, task_path.stem)
-        review_round.setdefault("fix_task_ids", []).append(task["task_id"])
+        if task["task_id"] not in review_round.setdefault("fix_task_ids", []):
+            review_round["fix_task_ids"].append(task["task_id"])
         control = project / "qa" / "chapter-controls" / f"{chapter_id}.json"
         write_json(control, {"rounds": rounds, "latest_round_status": review_round["latest_round_status"]})
         patch = executor.execute(task, model=model)
@@ -276,6 +296,7 @@ def run_chapter_qa_agent(
     glossary: list[dict[str, str]], executor: ReviewExecutor, *, reviewer_id: str,
     translation_owner_id: str, review_model: str, translation_backend: int,
     translation_executor: ReviewExecutor | None = None, translation_model: str = "gpt-6-luna-max",
+    resume_fix_task_id: str | None = None,
 ) -> Document:
     for section in document.sections:
         translated = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable]
@@ -309,6 +330,18 @@ def run_chapter_qa_agent(
         if control_record.get("latest_round_status") == "PASS":
             control_record["latest_round_status"] = "STALE"
             write_json(control, control_record)
+        if resume_fix_task_id is not None and load_translation_task(project, resume_fix_task_id)["chapter_id"] == section.section_id:
+            record = next(row for row in rounds if resume_fix_task_id in row.get("fix_task_ids", []))
+            document, applied = _agent_review_fixes(
+                project, document, section.section_id, record["issues"], provider, language, glossary,
+                translation_executor, translation_owner_id, translation_model, record, rounds,
+                resume_task_id=resume_fix_task_id,
+            )
+            record["fixes_applied"] = applied
+            record["fixes_completed"] = True
+            write_json(control, {"rounds": rounds, "latest_round_status": record["latest_round_status"]})
+            resume_fix_task_id = None
+            translated = [unit for unit in document.units if unit.section_id == section.section_id and unit.translatable]
         for _ in range(REVIEWS_PER_INVOCATION):
             context = json.dumps({"section_title": section.title}, ensure_ascii=False)
             batches = review_batches(translated, provider, language, context, language["review_rubric"])
@@ -377,7 +410,9 @@ def run_chapter_qa_agent(
                 document, applied = _agent_review_fixes(
                     project, document, section.section_id, issues, provider, language, glossary,
                     translation_executor, translation_owner_id, translation_model, record, rounds,
+                    resume_task_id=resume_fix_task_id,
                 )
+                resume_fix_task_id = None
             else:
                 issue_ids = {issue["unit_id"] for issue in issues}
                 selected = [unit for unit in translated if unit.id in issue_ids]

@@ -1,5 +1,3 @@
-from contextlib import redirect_stderr
-from io import StringIO
 import json
 from pathlib import Path
 import shutil
@@ -7,7 +5,6 @@ import unittest
 import uuid
 from unittest.mock import patch as mock_patch
 
-from private_translate.cli import main, parser
 from private_translate.core.execution import (
     PatchConflict,
     SCHEMAS,
@@ -285,18 +282,13 @@ class ExecutionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "target_digest"):
             validate_review_evidence(dict(evidence, target_digest="0" * 64), task)
 
-    def test_backend_default_is_agent_and_option_two_runs_api(self):
-        default_args = parser().parse_args(["run", "unused-project"])
-        self.assertEqual(default_args.translation_backend, 1)
+    def test_backend_selection_and_option_two_runs_api(self):
         self.assertEqual(select_translation_backend(1), "agent")
         self.assertEqual(select_translation_backend(2), "api")
 
         project, _ = self.project("# First\n\nHello.\n")
-        with mock_patch("private_translate.cli.run_project", return_value=[]) as cli_run:
-            self.assertEqual(main(["run", str(project), "--translation-backend", "2"]), 0)
-            self.assertEqual(cli_run.call_args.kwargs["translation_backend"], 2)
         provider = ApiProvider()
-        outputs = run_project(project, bilingual=True, provider=provider)
+        outputs = run_project(project, bilingual=True, provider=provider, translation_backend=2)
         self.assertEqual(provider.translation_calls, 1)
         self.assertEqual(len(outputs), 2)
         self.assertTrue(all(path.is_file() for path in outputs))
@@ -315,10 +307,6 @@ class ExecutionContractTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "AGENT_BACKEND_UNAVAILABLE"):
             run_project(project, provider=provider, translation_backend=1)
         self.assertEqual(provider.translation_calls, 0)
-        stderr = StringIO()
-        with redirect_stderr(stderr):
-            self.assertEqual(main(["run", str(project)]), 1)
-        self.assertIn("AGENT_BACKEND_UNAVAILABLE", stderr.getvalue())
 
 
 if __name__ == "__main__":

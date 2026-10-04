@@ -49,7 +49,7 @@ def _provider(base_url: str | None, model: str | None, language: dict) -> Transl
     endpoint = base_url or os.environ.get("PRIVATE_TRANSLATE_BASE_URL", "https://api.openai.com/v1")
     selected_model = model or os.environ.get("PRIVATE_TRANSLATE_MODEL")
     if not selected_model:
-        raise ValueError("Pass --model or set PRIVATE_TRANSLATE_MODEL; set OPENAI_API_KEY for the provider adapter")
+        raise ValueError("Pass model= or set PRIVATE_TRANSLATE_MODEL; set OPENAI_API_KEY for the provider adapter")
     return OpenAICompatibleProvider(endpoint, selected_model)
 
 
@@ -95,15 +95,27 @@ def _translate_agent(
     document: Document, project: Path, provider: TranslationProvider,
     language: dict, glossary: list[dict[str, str]], executor: AgentExecutor,
     model: str,
+    resume_task_id: str | None = None,
 ) -> Document:
     owner_id = "agent:translation-owner"
     for section, units in _pending_by_section(document):
         context = json.dumps({"section": section.title}, ensure_ascii=False)
-        for batch, batch_context, _ in translation_batches(units, provider, language, context, glossary):
+        if resume_task_id is not None:
+            saved = load_translation_task(project, resume_task_id)
+            selected = set(saved["unit_ids"])
+            batch = [unit for unit in units if unit.id in selected]
+            remaining = [unit for unit in units if unit.id not in selected]
+            batches = [(batch, json.dumps(saved["context_capsule"]["batch"], ensure_ascii=False), [])]
+            batches.extend(translation_batches(remaining, provider, language, context, glossary))
+        else:
+            batches = translation_batches(units, provider, language, context, glossary)
+        for batch, batch_context, _ in batches:
             task_path = create_translation_task(
                 project, section.section_id, owner_id,
                 unit_ids=[unit.id for unit in batch], batch_context=json.loads(batch_context),
+                resume_task_id=resume_task_id,
             )
+            resume_task_id = None
             task = load_translation_task(project, task_path.stem)
             for attempt in range(2):
                 patch = executor.execute(task, model=model)
@@ -178,7 +190,7 @@ def _assert_source_current(project: Path, manifest: dict, document: Document, ad
 def assert_project_source_current(project: Path) -> None:
     project, manifest, document = _load_project(project)
     if document is None:
-        raise ValueError("Project has not been parsed; run translate run first")
+        raise ValueError("Project has not been parsed; call advance_host_run first")
     _assert_source_current(project, manifest, document, _adapter(manifest["format"]))
 
 
@@ -219,6 +231,7 @@ def run_project(
     agent_model: str = DEFAULT_AGENT_MODEL, review_backend: int = 2,
     review_executor: AgentExecutor | None = None, reviewer_id: str = "agent:chapter-reviewer",
     review_model: str = DEFAULT_AGENT_REVIEW_MODEL, allow_review_fallback: bool = False,
+    resume_translation_task_id: str | None = None, resume_fix_task_id: str | None = None,
 ) -> list[Path]:
     backend = select_translation_backend(translation_backend)
     if backend == "agent" and agent_executor is None:
@@ -257,7 +270,8 @@ def run_project(
     prepare_terminology(project, fresh, active_provider, language)
     glossary = load_glossary(project / "glossary" / "terms.csv")
     if backend == "agent":
-        fresh = _translate_agent(fresh, project, active_provider, language, glossary, agent_executor, agent_model)
+        fresh = _translate_agent(fresh, project, active_provider, language, glossary, agent_executor, agent_model,
+                                 resume_task_id=resume_translation_task_id)
     else:
         _translate(fresh, project, active_provider, language, glossary)
     if selected_review_backend == "agent":
@@ -269,7 +283,9 @@ def run_project(
                 review_model=review_model, translation_backend=1 if backend == "agent" else 2,
                 translation_executor=agent_executor if backend == "agent" else None,
                 translation_model=agent_model,
+                resume_fix_task_id=resume_fix_task_id,
             )
+            resume_fix_task_id = None
             report = read_json(project / "qa" / "book-consistency.json")
             if report.get("status") == "PASS" and report.get("target_hash") == _target_hash(
                 [unit for unit in fresh.units if unit.translatable and unit.target_text is not None]
@@ -289,7 +305,7 @@ def run_project(
 def build_project(project: Path) -> list[Path]:
     project, manifest, document = _load_project(project)
     if document is None:
-        raise ValueError("Project has not been parsed; run translate run first")
+        raise ValueError("Project has not been parsed; call advance_host_run first")
     spotcheck = validate_spotcheck(project, document)
     result = _build(project, manifest, document)
     _write_run_state(project, "complete", spotcheck_run_id=spotcheck["run_id"])
@@ -299,7 +315,7 @@ def build_project(project: Path) -> list[Path]:
 def validate_project(project: Path) -> dict[str, str]:
     project, manifest, document = _load_project(project)
     if document is None:
-        raise ValueError("Project has not been parsed; run translate run first")
+        raise ValueError("Project has not been parsed; call advance_host_run first")
     validate_qa(project, document)
     target_path, bilingual_path = _output_paths(project, manifest)
     adapter = _adapter(manifest["format"])

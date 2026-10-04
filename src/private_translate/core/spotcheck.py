@@ -680,7 +680,7 @@ def validate_spotcheck(project: Path, document: Document) -> dict:
     root = project / "qa" / "spotcheck"
     active_path = root / "active.json"
     if not active_path.exists():
-        raise ValueError("No stratified spot-check run exists; use translate spotcheck first")
+        raise ValueError("No stratified spot-check run exists; call start_host_spotcheck first")
     active = read_json(active_path)
     run_dir = _run_directory(root, active)
     rounds = _round_dirs(run_dir)

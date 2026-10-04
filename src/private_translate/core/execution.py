@@ -285,6 +285,7 @@ def create_translation_task(
     polysemy_watchlist: list[dict] | None = None,
     unit_ids: list[str] | None = None,
     batch_context: dict | None = None,
+    resume_task_id: str | None = None,
 ) -> Path:
     manifest, document = _project_document(project)
     _require(_is_id(owner_id), "owner_id is required")
@@ -348,6 +349,13 @@ def create_translation_task(
         },
     }
     validate_translation_task(task)
+    if resume_task_id is not None:
+        saved = load_translation_task(project, resume_task_id)
+        transient = {"task_id", "created_at", "base_document_revision"}
+        if ({key: value for key, value in saved.items() if key not in transient}
+                != {key: value for key, value in task.items() if key not in transient}):
+            raise PatchConflict("PENDING_TASK_CHANGED: translation task no longer matches this batch")
+        return _task_path(project, resume_task_id)
     path = _task_path(project, task["task_id"])
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8", newline="\n") as stream:
