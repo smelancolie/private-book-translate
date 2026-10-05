@@ -87,6 +87,7 @@ class AgentSpotcheckTests(unittest.TestCase):
         write_json(self.project / "work" / "document.json", self.document.to_dict())
         write_json(self.project / "qa" / "book-consistency.json", {
             "status": "PASS", "target_hash": _target_hash(translated),
+            "glossary_hash": content_hash("[]"),
         })
 
     def _cleanup(self):

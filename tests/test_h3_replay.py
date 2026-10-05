@@ -40,10 +40,10 @@ class H3ReplayTests(unittest.TestCase):
         return project / "qa/chapter-controls" / f"{document.sections[0].section_id}.json"
 
     def task(self, project, document, status="completed", issues=None):
-        section = document.sections[0].section_id
-        task = create_review_task(document, section, "agent:reviewer", "api:translation-owner",
-                                  self.language["review_rubric"])
-        task["context_capsule"]["chapter_target_digest"] = task["target_digest"]
+        with patch("private_translate.core.qa._agent_review_evidence", side_effect=RuntimeError("capture task")) as call:
+            with self.assertRaisesRegex(RuntimeError, "capture task"):
+                self.run_h3(project, document)
+        task = call.call_args.args[2]
         write_json(project / "work/tasks/review" / f"{task['task_id']}.json", task)
         set_review_task_status(project, task, status)
         if status == "completed":

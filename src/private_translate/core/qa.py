@@ -100,6 +100,11 @@ def _append_round(path: Path, rounds: list[dict], record: dict) -> dict:
     return record
 
 
+def _review_task_matches(saved: dict, candidate: dict) -> bool:
+    return all(saved[key] == candidate[key] for key in
+               ("reviewer_id", "translation_owner_id", "source_units", "target_units", "rubric", "context_capsule"))
+
+
 def _agent_review_evidence(project: Path, document: Document, candidate: dict,
                            executor: ReviewExecutor, model: str, budget: int) -> dict:
     task = candidate
@@ -116,8 +121,7 @@ def _agent_review_evidence(project: Path, document: Document, candidate: dict,
             if not state_path.exists() or read_json(state_path)["status"] not in {"superseded", "rejected"}:
                 set_review_task_status(project, saved, "superseded", reason=str(error))
             continue
-        if any(saved[key] != candidate[key] for key in
-               ("reviewer_id", "translation_owner_id", "source_units", "target_units", "rubric")):
+        if not _review_task_matches(saved, candidate):
             continue
         full_digest = saved["context_capsule"].get("chapter_target_digest")
         if full_digest is None:
@@ -166,10 +170,20 @@ def run_chapter_qa(project: Path, document: Document, provider: TranslationProvi
         translated = [unit for unit in units if unit.translatable]
         if not translated:
             continue
-        if all(unit.qa_status == "passed" and unit.target_text is not None and unit.last_qa_target_hash == content_hash(unit.target_text) for unit in translated):
-            continue
         control = project / "qa" / "chapter-controls" / f"{section.section_id}.json"
         rounds = read_json(control).get("rounds", []) if control.exists() else []
+        review_config = {"review_model": provider.capabilities.model, "rubric": language["review_rubric"],
+                         "context_capsule": {"section_title": section.title, "glossary": glossary}}
+        if (all(unit.qa_status == "passed" and unit.target_text is not None
+                and unit.last_qa_target_hash == content_hash(unit.target_text) for unit in translated)
+                and rounds and rounds[-1].get("review_config") == review_config
+                and rounds[-1]["latest_round_status"] == "PASS"):
+            continue
+        if rounds and rounds[-1]["latest_round_status"] == "PASS":
+            for unit in translated:
+                unit.qa_status = "pending"
+                unit.last_qa_target_hash = None
+            _save_document(project, document)
         for _ in range(REVIEWS_PER_INVOCATION):
             current_round = len(rounds) + 1
             context = json.dumps({"section_title": section.title, "glossary": glossary}, ensure_ascii=False)
@@ -186,6 +200,7 @@ def run_chapter_qa(project: Path, document: Document, provider: TranslationProvi
                     "allow_next_chapter": True,
                     "target_hash": _target_hash(translated),
                     "review_batch_count": review_batch_count,
+                    "review_config": review_config,
                 }
                 _append_round(control, rounds, record)
                 for unit in translated:
@@ -318,6 +333,8 @@ def run_chapter_qa_agent(
     resume_fix_task_id: str | None = None,
     capabilities: ProviderCapabilities | None = None,
 ) -> Document:
+    if reviewer_id == translation_owner_id:
+        raise ValueError("reviewer_id must differ from translation_owner_id")
     active_capabilities = capabilities if capabilities is not None else provider.capabilities
     budget = provider_budgets(active_capabilities, language)["review_batch_target_tokens"]
     for section in document.sections:
@@ -327,31 +344,6 @@ def run_chapter_qa_agent(
         control = project / "qa" / "chapter-controls" / f"{section.section_id}.json"
         control_record = read_json(control) if control.exists() else {}
         rounds = control_record.get("rounds", [])
-        target_digest = review_target_digest([
-            {"unit_id": unit.id, "target_text": unit.target_text or ""} for unit in translated
-        ])
-        passed = next((row for row in reversed(rounds) if
-                       row.get("scope") == "FULL_CHAPTER"
-                       and row.get("latest_round_status") == "PASS"
-                       and row.get("issues_found") == 0
-                       and row.get("coverage_status") == "FULL_CHAPTER_COVERAGE"
-                       and row.get("target_digest") == target_digest
-                       and row.get("evidence_task_ids")
-                       and all(not (project / "work" / "task-state" / "review" / f"{task_id}.json").exists()
-                               or read_json(project / "work" / "task-state" / "review" / f"{task_id}.json")["status"] == "completed"
-                               for task_id in row["evidence_task_ids"])), None)
-        if passed is not None:
-            for unit in translated:
-                unit.qa_status = "passed"
-                unit.last_qa_target_hash = content_hash(unit.target_text)
-                unit.last_error = None
-            control_record["latest_round_status"] = "PASS"
-            write_json(control, control_record)
-            _save_document(project, document)
-            continue
-        if control_record.get("latest_round_status") == "PASS":
-            control_record["latest_round_status"] = "STALE"
-            write_json(control, control_record)
         if resume_fix_task_id is not None and load_translation_task(project, resume_fix_task_id)["chapter_id"] == section.section_id:
             record = next(row for row in rounds if resume_fix_task_id in row.get("fix_task_ids", []))
             document, applied = _agent_review_fixes(
@@ -373,6 +365,7 @@ def run_chapter_qa_agent(
                     language["review_rubric"],
                     context_capsule={
                         "section_title": section.title,
+                        "review_model": review_model,
                         "batch_context": json.loads(batch_context),
                         "glossary_slice": [term for term in glossary if term["source"].casefold() in source_text],
                         "review_batch": {"index": index, "count": count, "unit_ids": [unit.id for unit in batch]},
@@ -389,10 +382,42 @@ def run_chapter_qa_agent(
             batch_ids = [unit.id for batch, _ in batches for unit in batch]
             if batch_ids != expected_ids:
                 raise ValueError("Agent review batches must cover the complete chapter exactly once")
+            tasks = [task_for_batch(batch, batch_context, index, len(batches))
+                     for index, (batch, batch_context) in enumerate(batches)]
+            target_digest = review_target_digest([
+                {"unit_id": unit.id, "target_text": unit.target_text or ""} for unit in translated
+            ])
+            passed = next((row for row in reversed(rounds) if
+                           row.get("scope") == "FULL_CHAPTER"
+                           and row.get("latest_round_status") == "PASS"
+                           and row.get("issues_found") == 0
+                           and row.get("coverage_status") == "FULL_CHAPTER_COVERAGE"
+                           and row.get("target_digest") == target_digest
+                           and row.get("review_model") == review_model
+                           and len(row.get("evidence_task_ids", [])) == len(tasks)
+                           and all(_review_task_matches(
+                               read_json(project / "work/tasks/review" / f"{task_id}.json"), task)
+                               and (not (project / "work/task-state/review" / f"{task_id}.json").exists()
+                                    or read_json(project / "work/task-state/review" / f"{task_id}.json")["status"] == "completed")
+                               for task_id, task in zip(row["evidence_task_ids"], tasks, strict=True))), None)
+            if passed is not None:
+                for unit in translated:
+                    unit.qa_status = "passed"
+                    unit.last_qa_target_hash = content_hash(unit.target_text)
+                    unit.last_error = None
+                write_json(control, {"rounds": rounds, "latest_round_status": "PASS"})
+                _save_document(project, document)
+                break
+            if control_record.get("latest_round_status") == "PASS":
+                control_record["latest_round_status"] = "STALE"
+                write_json(control, control_record)
+            for unit in translated:
+                unit.qa_status = "pending"
+                unit.last_qa_target_hash = None
+            _save_document(project, document)
             evidence_task_ids = []
             issues = []
-            for index, (batch, batch_context) in enumerate(batches):
-                task = task_for_batch(batch, batch_context, index, len(batches))
+            for task in tasks:
                 evidence = _agent_review_evidence(project, document, task, executor, review_model, budget)
                 evidence_task_ids.append(evidence["task_id"])
                 issues.extend(evidence["issues"])
@@ -516,9 +541,12 @@ def run_book_consistency(project: Path, document: Document, provider: Translatio
     glossary_hash = content_hash(json.dumps(glossary, ensure_ascii=False, sort_keys=True))
     previous = read_json(report_path) if report_path.exists() else {}
     rounds = previous.get("rounds", [])
+    review_config = {"review_model": provider.capabilities.model, "rubric": language["consistency_rubric"]}
     for _ in range(REVIEWS_PER_INVOCATION):
         issues, candidates = _consistency_candidates(project, translated, glossary)
-        if previous.get("status") == "PASS" and previous.get("target_hash") == current_hash and previous.get("glossary_hash") == glossary_hash:
+        if (previous.get("status") == "PASS" and previous.get("target_hash") == current_hash
+                and previous.get("glossary_hash") == glossary_hash
+                and previous.get("review_config") == review_config):
             return
         for candidate in candidates:
             candidate_units = [translated_by_id[unit_id] for unit_id in candidate["unit_ids"]]
@@ -533,7 +561,8 @@ def run_book_consistency(project: Path, document: Document, provider: Translatio
         current_round = len(rounds) + 1
         if not issues:
             rounds.append({"round": current_round, "issues_found": 0, "fixes_applied": 0, "status": "PASS"})
-            write_json(report_path, {"status": "PASS", "target_hash": _target_hash(translated), "glossary_hash": glossary_hash, "rounds": rounds})
+            write_json(report_path, {"status": "PASS", "target_hash": _target_hash(translated), "glossary_hash": glossary_hash,
+                                     "review_config": review_config, "rounds": rounds})
             return
         ids = {issue["unit_id"] for issue in issues if issue.get("unit_id")}
         known_ids = set(translated_by_id)
@@ -644,7 +673,11 @@ def run_book_consistency_agent(
     target_hash = _target_hash(translated)
     glossary_hash = content_hash(json.dumps(glossary, ensure_ascii=False, sort_keys=True))
     report = read_json(report_path) if report_path.exists() else {"rounds": []}
-    if report.get("status") == "PASS" and report.get("actual_backend") == 1 and report["target_hash"] == target_hash and report["glossary_hash"] == glossary_hash:
+    review_config = {"reviewer_id": reviewer_id, "translation_owner_id": translation_owner_id,
+                     "review_model": review_model, "rubric": language["consistency_rubric"]}
+    if (report.get("status") == "PASS" and report.get("actual_backend") == 1
+            and report["target_hash"] == target_hash and report["glossary_hash"] == glossary_hash
+            and report.get("review_config") == review_config):
         return document
     active = report.get("active_round")
     if active is None:
@@ -652,6 +685,7 @@ def run_book_consistency_agent(
         by_id = {unit.id: unit for unit in translated}
         active = {"round": len(report["rounds"]) + 1, "phase": "review", "task_ids": [],
                   "target_hash": target_hash, "glossary_hash": glossary_hash,
+                  "review_config": review_config,
                   "issues": issues, "fix_task_ids": [], "fixes_applied": 0}
         for candidate in candidates:
             units = [by_id[unit_id] for unit_id in candidate["unit_ids"]]
@@ -684,8 +718,10 @@ def run_book_consistency_agent(
                 write_json(project / "work/tasks/consistency" / f"{task['task_id']}.json", task)
                 active["task_ids"].append(task["task_id"])
         report.update(status="REVIEWING", target_hash=target_hash, glossary_hash=glossary_hash,
-                      active_round=active, requested_backend=1, actual_backend=1)
+                      active_round=active, requested_backend=1, actual_backend=1, review_config=review_config)
         write_json(report_path, report)
+    if active["review_config"] != review_config:
+        raise PatchConflict("BOOK_CONSISTENCY_CONFIG_CHANGED: resume with the pending review configuration")
     if active["glossary_hash"] != glossary_hash:
         raise PatchConflict("STALE_BOOK_CONSISTENCY: approved glossary changed")
     if active["phase"] == "review":
@@ -804,9 +840,15 @@ def validate_qa(project: Path, document: Document) -> None:
     )]
     if failed:
         raise ValueError(f"Translation or chapter QA is incomplete for {len(failed)} units")
-    report = project / "qa" / "book-consistency.json"
-    if not report.exists() or read_json(report).get("status") != "PASS":
+    report_path = project / "qa" / "book-consistency.json"
+    if not report_path.exists():
+        raise ValueError("Book-level consistency QA has not passed")
+    report = read_json(report_path)
+    if report.get("status") != "PASS":
         raise ValueError("Book-level consistency QA has not passed")
     translated = [unit for unit in document.units if unit.translatable and unit.target_text is not None]
-    if read_json(report).get("target_hash") != _target_hash(translated):
+    if report.get("target_hash") != _target_hash(translated):
         raise ValueError("Book-level consistency QA is stale for the current targets")
+    glossary = load_glossary(project / "glossary/terms.csv")
+    if report.get("glossary_hash") != content_hash(json.dumps(glossary, ensure_ascii=False, sort_keys=True)):
+        raise ValueError("Book-level consistency QA is stale for the current approved glossary")

@@ -52,7 +52,9 @@ class SpotcheckTests(unittest.TestCase):
                 unit.qa_status = "passed"
         translated = [unit for unit in self.units if unit.translatable and unit.target_text is not None]
         target_hash = content_hash(json.dumps([(unit.id, unit.target_text) for unit in translated], ensure_ascii=False, separators=(",", ":")))
-        write_json(self.root / "qa" / "book-consistency.json", {"status": "PASS", "target_hash": target_hash})
+        write_json(self.root / "qa" / "book-consistency.json", {
+            "status": "PASS", "target_hash": target_hash, "glossary_hash": content_hash("[]"),
+        })
 
     def tearDown(self):
         if self.root.exists():
