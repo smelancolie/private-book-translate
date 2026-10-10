@@ -1,5 +1,7 @@
 # 私人长文本翻译
 
+**简体中文** | [English](README_en.md)
+
 本地文件优先的 EPUB / Markdown 翻译项目，正式执行入口为 **Codex / host integration → Python core**，第一版语言对为 English → 简体中文（`en` → `zh-Hans`）。源文件、翻译状态、术语表、QA 记录和输出都保存在独立的 `projects/<id>/` 工作区；每个项目自带 Git 忽略规则，在 Git 仓库内初始化时还会确认私有状态确实被忽略。
 
 正式宿主流程中的术语提案、翻译、章节复核、全书一致性及修复均由 Codex Agent 执行。Python core 不构造或调用 HTTP provider，不需要配置独立的 provider API 密钥；模型请求由宿主接管。内部 API 执行路径继续使用既有 provider adapter，其密钥只从环境变量读取，不写入项目。
